@@ -118,9 +118,19 @@ def test_scan_files_ignores_short_identifiers(checker: ModuleType, tmp_path: Pat
     assert checker.scan_files(identifiers, [file_path]) == []
 
 
-def test_main_exits_zero_when_env_var_empty(
-    monkeypatch: pytest.MonkeyPatch, checker: ModuleType
+def test_main_exits_zero_when_env_var_empty_and_repo_not_public(
+    monkeypatch: pytest.MonkeyPatch, checker: ModuleType, tmp_path: Path
 ) -> None:
+    """An unconfigured gate is a no-op in a repo that is not declared public.
+
+    Keeps a fresh clone or a fork without the secret committable.
+    """
+    (tmp_path / "publication.toml").write_text(
+        '[publication]\nremote_owner = "x"\nauthor_email = ["a@b"]\n'
+        'visibility = "private-until-review"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "")
 
     def fake_run(*args: object, **kwargs: object) -> CompletedProcess[str]:
@@ -129,6 +139,30 @@ def test_main_exits_zero_when_env_var_empty(
     monkeypatch.setattr(checker.subprocess, "run", fake_run)
     assert checker.main([]) == 0
 
+
+def test_main_fails_closed_when_env_var_empty_and_repo_public(
+    monkeypatch: pytest.MonkeyPatch, checker: ModuleType, tmp_path: Path
+) -> None:
+    """The same unconfigured gate is a FAILURE once the repo declares public.
+
+    Exiting 0 here would print "skipping" and go green having scanned nothing —
+    indistinguishable from a clean tree, on exactly the repos where a leak is
+    irreversible. This is the negative control for the test above: the only
+    difference between them is the declared visibility.
+    """
+    (tmp_path / "publication.toml").write_text(
+        '[publication]\nremote_owner = "x"\nauthor_email = ["a@b"]\n'
+        'visibility = "public"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "")
+
+    def fake_run(*args: object, **kwargs: object) -> CompletedProcess[str]:
+        return CompletedProcess(args=[], returncode=0, stdout="")
+
+    monkeypatch.setattr(checker.subprocess, "run", fake_run)
+    assert checker.main([]) == 1
 
 def test_main_exits_one_on_violation(
     monkeypatch: pytest.MonkeyPatch, checker: ModuleType, tmp_path: Path
