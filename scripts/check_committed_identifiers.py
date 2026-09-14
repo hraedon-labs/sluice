@@ -128,9 +128,7 @@ def parse_identifier_set(raw: str) -> frozenset[str]:
         try:
             tokens.update(shlex.split(content))
         except ValueError as exc:  # unbalanced quote
-            raise ValueError(
-                f"denylist entry could not be parsed (check quoting): {exc}"
-            ) from exc
+            raise ValueError(f"denylist entry could not be parsed (check quoting): {exc}") from exc
     return _filter_identifiers(frozenset(tokens))
 
 
@@ -355,8 +353,13 @@ def collect_staged_paths() -> list[Path]:
     """
     return _paths_from_git(
         [
-            "git", "diff", "--cached", "--name-only",
-            "--diff-filter=ACM", "--no-renames", "-z",
+            "git",
+            "diff",
+            "--cached",
+            "--name-only",
+            "--diff-filter=ACM",
+            "--no-renames",
+            "-z",
         ]
     )
 
@@ -428,7 +431,7 @@ def _unconfigured(reason: str) -> None:
     """
     if _declares_public():
         raise GateError(
-            f"{reason} but {_DECLARATION_FILENAME} declares visibility=\"public\". "
+            f'{reason} but {_DECLARATION_FILENAME} declares visibility="public". '
             "A public repo with an unconfigured gate is a silent pass, so this is "
             "a failure, not a skip. Provide the denylist via the FORBIDDEN_IDENTIFIERS "
             "environment variable (in CI, the shared organisation secret of that name)."

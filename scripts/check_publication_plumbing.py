@@ -88,9 +88,7 @@ def load_declaration(repo_root: Path) -> Declaration | None:
     if not isinstance(section, dict):
         raise PlumbingError(f"{DECLARATION_FILENAME} has no [publication] table")
 
-    missing = [
-        k for k in ("remote_owner", "author_email", "visibility") if k not in section
-    ]
+    missing = [k for k in ("remote_owner", "author_email", "visibility") if k not in section]
     if missing:
         raise PlumbingError(
             f"{DECLARATION_FILENAME} [publication] is missing: {', '.join(missing)}"
@@ -106,14 +104,11 @@ def load_declaration(repo_root: Path) -> Declaration | None:
         ) from exc
     raw_authors = section["author_email"]
     authors = (
-        tuple(str(a) for a in raw_authors)
-        if isinstance(raw_authors, list)
-        else (str(raw_authors),)
+        tuple(str(a) for a in raw_authors) if isinstance(raw_authors, list) else (str(raw_authors),)
     )
     if not authors or not all(a.strip() for a in authors):
         raise PlumbingError(
-            f"{DECLARATION_FILENAME} author_email must be a non-empty address "
-            f"or list of addresses"
+            f"{DECLARATION_FILENAME} author_email must be a non-empty address or list of addresses"
         )
     return Declaration(
         remote_owner=str(section["remote_owner"]),
@@ -275,7 +270,7 @@ def check(
                     f"{Visibility.PRIVATE_UNTIL_REVIEW.value} but the remote is {actual}. "
                     f"Either make "
                     f"the remote private again, or — if a publication review has cleared "
-                    f"it — set visibility = \"public\" in the declaration."
+                    f'it — set visibility = "public" in the declaration.'
                 )
         case Visibility.PUBLIC:
             pass

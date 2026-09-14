@@ -121,7 +121,7 @@ def test_scan_files_ignores_short_identifiers(checker: ModuleType, tmp_path: Pat
 def test_main_exits_zero_when_env_var_empty(
     monkeypatch: pytest.MonkeyPatch, checker: ModuleType
 ) -> None:
-    monkeypatch.setenv("SLUICE_FORBIDDEN_IDENTIFIERS", "")
+    monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "")
 
     def fake_run(*args: object, **kwargs: object) -> CompletedProcess[str]:
         return CompletedProcess(args=[], returncode=0, stdout="")
@@ -136,7 +136,7 @@ def test_main_exits_one_on_violation(
 
     file_path = tmp_path / "leaked.txt"
     file_path.write_text("Secret FAKEDOM value\n", encoding="utf-8")
-    monkeypatch.setenv("SLUICE_FORBIDDEN_IDENTIFIERS", "FAKEDOM")
+    monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "FAKEDOM")
 
     def fake_run(*args: object, **kwargs: object) -> CompletedProcess[str]:
         return CompletedProcess(args=[], returncode=0, stdout=f"{file_path}\0")
@@ -150,7 +150,7 @@ def test_main_exits_zero_when_no_violation(
 ) -> None:
     file_path = tmp_path / "clean.txt"
     file_path.write_text("Nothing sensitive here.\n", encoding="utf-8")
-    monkeypatch.setenv("SLUICE_FORBIDDEN_IDENTIFIERS", "FAKEDOM")
+    monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "FAKEDOM")
 
     def fake_run(*args: object, **kwargs: object) -> CompletedProcess[str]:
         return CompletedProcess(args=[], returncode=0, stdout=f"{file_path}\0")
@@ -165,7 +165,7 @@ def test_staged_mode_scans_staged_diff(
     """--staged routes through `git diff --cached` and still flags violations."""
     file_path = tmp_path / "staged.txt"
     file_path.write_text("Secret FAKEDOM value\n", encoding="utf-8")
-    monkeypatch.setenv("SLUICE_FORBIDDEN_IDENTIFIERS", "FAKEDOM")
+    monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "FAKEDOM")
 
     seen: dict[str, list[str]] = {}
 
