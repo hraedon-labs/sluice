@@ -8,13 +8,20 @@ Two complementary checks:
    ``samples/`` directory holds real environment data (hostnames, service
    accounts, principal handles) that must never be committed (AGENTS.md).
 
-2. Secret-driven: when ``SLUICE_FORBIDDEN_IDENTIFIERS`` is set (a
+2. Secret-driven: when ``FORBIDDEN_IDENTIFIERS`` is set (a
    whitespace-separated list of real identifiers — hostnames, emails, service
    accounts, principal handles, personal names), every tracked text file
    outside ``samples/`` is scanned for those identifiers. This catches real
-   names that leaked into docs, tests, or reflections. It is a no-op (exit 0)
-   until the secret is configured, so it never blocks a fresh clone or a fork
-   without the secret.
+   names that leaked into docs, tests, or reflections.
+
+   Unconfigured behaviour depends on ``publication.toml``. In a repo declaring
+   ``private-until-review`` (or with no declaration at all) a missing secret is a
+   no-op (exit 0), so a fresh clone or a fork without the secret is never
+   blocked. In a repo declaring ``visibility = "public"`` it is a **failure**
+   (exit 1): an unconfigured gate there prints "skipping" and exits 0, which is
+   indistinguishable from a clean tree — a silent pass on exactly the repos where
+   a leak is irreversible. That asymmetry was documented in publication.toml for
+   months before it was implemented here.
 
    **Multi-word identifiers are double-quoted** (``"two words"``) and match any
    separator run — spaced, hyphenated, underscored, dotted, or wrapped across a
@@ -35,6 +42,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -55,6 +63,11 @@ _SKIP_DIRS = frozenset({".venv"})
 # guard matches the first path component so a legitimate nested code dir named
 # ``samples`` (e.g. ``tests/samples/``) is not a false positive.
 _GUARDED_DIRS = frozenset({"samples"})
+
+# The plumbing declaration. Read here for ONE purpose: deciding whether an
+# unconfigured gate is a benign no-op or a silent pass. check_publication_plumbing.py
+# remains the authority on everything else in this file.
+_DECLARATION_FILENAME = "publication.toml"
 
 
 @dataclass(frozen=True)
@@ -366,30 +379,78 @@ def leaked_tracked_files(paths: list[Path], guarded: frozenset[str]) -> list[Pat
     return [p for p in paths if p.parts and p.parts[0] in guarded]
 
 
+def _declares_public() -> bool:
+    """True when this repo's publication.toml declares public visibility.
+
+    Governs whether a missing denylist is a no-op or a hard failure. The
+    distinction is the whole point: a private-until-review repo must stay
+    clonable and committable without the secret, but a PUBLIC repo whose gate is
+    unconfigured is a silent pass — the scan prints "skipping" and exits 0, and
+    nothing downstream can tell that apart from a clean tree.
+
+    Absence of the file is False (fail-open): a repo that never opted into the
+    publication system is not suddenly blocked. A file that is PRESENT but
+    unparseable is a GateError, not False — that repo did opt in, and guessing
+    its visibility is exactly the coin-flip this function exists to remove.
+    """
+    try:
+        repo_root = Path(_run_git(["git", "rev-parse", "--show-toplevel"]).strip())
+    except GateError:
+        # Not a git repo (or git is unusable). The caller's other git work will
+        # surface that; do not convert it into a publication verdict here.
+        return False
+
+    path = repo_root / _DECLARATION_FILENAME
+    if not path.is_file():
+        return False
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is present but could not be parsed ({exc}); "
+            "the gate cannot tell whether this repo is public, so it will not pass."
+        ) from exc
+
+    section = raw.get("publication")
+    if not isinstance(section, dict):
+        raise GateError(
+            f"{_DECLARATION_FILENAME} has no [publication] table; the gate cannot "
+            "tell whether this repo is public, so it will not pass."
+        )
+    return str(section.get("visibility", "")).strip() == "public"
+
+
+def _unconfigured(reason: str) -> None:
+    """Handle a denylist that is unset or unusable.
+
+    Returns quietly (caller no-ops) for a non-public repo; raises GateError for a
+    public one.
+    """
+    if _declares_public():
+        raise GateError(
+            f"{reason} but {_DECLARATION_FILENAME} declares visibility=\"public\". "
+            "A public repo with an unconfigured gate is a silent pass, so this is "
+            "a failure, not a skip. Provide the denylist via the FORBIDDEN_IDENTIFIERS "
+            "environment variable (in CI, the shared organisation secret of that name)."
+        )
+    print(f"{reason}; skipping identifier gate.", file=sys.stderr)
+
+
 def _resolve_identifiers() -> frozenset[str] | None:
     """Return the configured denylist, or None if the gate should no-op.
 
     Shared by the message-scanning modes so they honor exactly the same
     configured/unconfigured semantics as the tracked-tree scan.
     """
-    raw = os.environ.get("SLUICE_FORBIDDEN_IDENTIFIERS", "")
+    raw = os.environ.get("FORBIDDEN_IDENTIFIERS", "")
     if not raw.strip():
-        # Split so the line still fits at 100 columns after the per-repo env-var
-        # substitution: the longest name in the estate is 52 characters, 19 more
-        # than the canonical one, which pushed this over the limit in two repos.
-        print(
-            "SLUICE_FORBIDDEN_IDENTIFIERS is empty or unset; "
-            "skipping identifier gate.",
-            file=sys.stderr,
-        )
+        _unconfigured("FORBIDDEN_IDENTIFIERS is empty or unset")
         return None
     identifiers = parse_identifier_set(raw)
     if not identifiers:
-        print(
-            "SLUICE_FORBIDDEN_IDENTIFIERS contained no usable "
-            f"identifiers (minimum length is {MIN_IDENTIFIER_LENGTH} "
-            "characters); skipping gate.",
-            file=sys.stderr,
+        _unconfigured(
+            "FORBIDDEN_IDENTIFIERS contained no usable identifiers "
+            f"(minimum length is {MIN_IDENTIFIER_LENGTH} characters)"
         )
         return None
     return identifiers
@@ -465,27 +526,14 @@ def _run(args: argparse.Namespace) -> int:
         return 1
 
     # 2. Secret-driven: scan tracked text files (outside guarded dirs) for
-    #    forbidden identifiers. No-op until the secret is configured.
-    raw = os.environ.get("SLUICE_FORBIDDEN_IDENTIFIERS", "")
-    if not raw.strip():
-        # Split so the line still fits at 100 columns after the per-repo env-var
-        # substitution: the longest name in the estate is 52 characters, 19 more
-        # than the canonical one, which pushed this over the limit in two repos.
-        print(
-            "SLUICE_FORBIDDEN_IDENTIFIERS is empty or unset; "
-            "skipping identifier gate.",
-            file=sys.stderr,
-        )
-        return 0
-
-    identifiers = parse_identifier_set(raw)
-    if not identifiers:
-        print(
-            "SLUICE_FORBIDDEN_IDENTIFIERS contained no usable "
-            f"identifiers (minimum length is {MIN_IDENTIFIER_LENGTH} "
-            "characters); skipping gate.",
-            file=sys.stderr,
-        )
+    #    forbidden identifiers. A no-op until the secret is configured — EXCEPT in
+    #    a repo declaring public visibility, where _resolve_identifiers raises
+    #    rather than let an unconfigured gate report a green pass.
+    #
+    #    This path used to duplicate the resolver inline, so the tree scan and the
+    #    message scans could drift apart in exactly the semantics that matter.
+    identifiers = _resolve_identifiers()
+    if identifiers is None:
         return 0
 
     scan_paths = [p for p in paths if not any(part in _SKIP_DIRS for part in p.parts)]

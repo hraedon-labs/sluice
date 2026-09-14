@@ -32,18 +32,18 @@ python_bin="$repo_root/.venv/bin/python"
 [ -x "$python_bin" ] || python_bin="$(command -v python3 || command -v python)"
 
 # Resolve the denylist once (same order as pre-commit; see that hook).
-if [ -z "${SLUICE_FORBIDDEN_IDENTIFIERS:-}" ]; then
+if [ -z "${FORBIDDEN_IDENTIFIERS:-}" ]; then
   for candidate in \
     "$repo_root/.identifiers-denylist.local" \
     "$HOME/.config/agent-suite/forbidden-identifiers"; do
     if [ -f "$candidate" ]; then
-      SLUICE_FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
-      export SLUICE_FORBIDDEN_IDENTIFIERS
+      FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
+      export FORBIDDEN_IDENTIFIERS
       break
     fi
   done
 fi
-if [ -z "${SLUICE_FORBIDDEN_IDENTIFIERS:-}" ]; then
+if [ -z "${FORBIDDEN_IDENTIFIERS:-}" ]; then
   echo "sluice pre-push: message gate INACTIVE — no denylist found." >&2
 fi
 
@@ -79,7 +79,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     status=1
   fi
 
-  if [ -n "${SLUICE_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  if [ -n "${FORBIDDEN_IDENTIFIERS:-}" ]; then
     if ! "$python_bin" "$repo_root/scripts/check_committed_identifiers.py" \
         --rev-range "$rev_range"; then
       status=1

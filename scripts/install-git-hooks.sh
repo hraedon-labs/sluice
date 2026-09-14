@@ -13,6 +13,6 @@ for hook in pre-commit commit-msg pre-push; do
 done
 git -C "$repo_root" config core.hooksPath githooks
 echo "core.hooksPath -> githooks (pre-commit, commit-msg, pre-push active)"
-echo "Next: provide a denylist via \$SLUICE_FORBIDDEN_IDENTIFIERS or"
+echo "Next: provide a denylist via \$FORBIDDEN_IDENTIFIERS or"
 echo "      .identifiers-denylist.local (gitignored)."
 echo "      Declare publication plumbing in publication.toml (see that file)."

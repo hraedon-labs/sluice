@@ -14,7 +14,7 @@
 
 [publication]
 # Expected owner of the push URL. A push to any other owner is refused.
-remote_owner = "hraedon"
+remote_owner = "hraedon-labs"
 
 # Expected author identity on every commit being pushed. Guards the
 # multi-identity-box accident: right code, wrong signature. May be a single
