@@ -420,7 +420,42 @@ def _declares_public() -> bool:
             f"{_DECLARATION_FILENAME} has no [publication] table; the gate cannot "
             "tell whether this repo is public, so it will not pass."
         )
-    return str(section.get("visibility", "")).strip() == "public"
+    # The set of legal visibilities is closed, and owned by Visibility in
+    # check_publication_plumbing.py. Compare against it rather than against the
+    # bare string "public": anything outside the set is a GateError, not a quiet
+    # "not public".
+    #
+    # This used to be `str(section.get("visibility", "")).strip() == "public"`,
+    # which coerced every other shape into the fail-OPEN branch. On a public repo
+    # that silently disarmed the gate -- the exact "nothing was scanned and CI is
+    # green" failure this function exists to prevent. A wrong-cased value
+    # ("Public"), a missing visibility key, an empty string, and a non-string
+    # (visibility = true) all took that branch. The declaration flip is precisely
+    # the commit where this matters: a case typo or a dropped line in the
+    # publication-review commit disarmed every later run.
+    if "visibility" not in section:
+        raise GateError(
+            f"{_DECLARATION_FILENAME} has a [publication] table but no visibility "
+            "key; the gate cannot tell whether this repo is public, so it will "
+            "not pass."
+        )
+    declared = section["visibility"]
+    if not isinstance(declared, str):
+        raise GateError(
+            f"{_DECLARATION_FILENAME} declares visibility={declared!r}, which is "
+            f"{type(declared).__name__} rather than a string; the gate cannot tell "
+            "whether this repo is public, so it will not pass."
+        )
+    normalised = declared.strip().casefold()
+    if normalised == "public":
+        return True
+    if normalised == "private-until-review":
+        return False
+    raise GateError(
+        f"{_DECLARATION_FILENAME} declares visibility={declared!r}, which is not "
+        'one of "public" or "private-until-review"; the gate cannot tell whether '
+        "this repo is public, so it will not pass."
+    )
 
 
 def _unconfigured(reason: str) -> None:
