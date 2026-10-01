@@ -22,6 +22,7 @@ dependencies installed.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -29,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 
@@ -747,7 +749,7 @@ class DeclarationSourceContract(VisibilityContract):
     # -- a history the gate cannot see whole is refused ------------------------
 
     def _deleted_public_history(self) -> None:
-        """public declaration, then deleted, then a later commit (no denylist)."""
+        """Commit a public declaration, delete it, then commit again (no denylist)."""
         self._run(self._declare("public"))
         self._git("rm", "-q", "publication.toml")
         self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
@@ -828,6 +830,95 @@ class DeclarationSourceContract(VisibilityContract):
         self._git("add", "README.md")
         result = self._gate("--staged")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _forge_commit_graph_roots(self) -> None:
+        """Write a commit-graph, blank every commit's parents, and re-seal its checksum."""
+        self._git("commit-graph", "write", "--reachable")
+        path = self.root / ".git" / "objects" / "info" / "commit-graph"
+        data = bytearray(path.read_bytes())
+        hash_len = 20 if data[5] == 1 else 32
+        chunks: dict[bytes, int] = {}
+        for i in range(data[6] + 1):
+            entry = 8 + 12 * i
+            chunks[bytes(data[entry : entry + 4])] = int.from_bytes(data[entry + 4 : entry + 12])
+        count = int.from_bytes(data[chunks[b"OIDF"] + 255 * 4 : chunks[b"OIDF"] + 256 * 4])
+        for n in range(count):
+            row = chunks[b"CDAT"] + n * (hash_len + 16) + hash_len
+            data[row : row + 8] = (0x70000000).to_bytes(4) * 2  # GRAPH_PARENT_NONE x2
+        body = bytes(data[:-hash_len])
+        # Git's own object-format checksum, not a security use.
+        if hash_len == 20:
+            digest = hashlib.sha1(body, usedforsecurity=False)
+        else:
+            digest = hashlib.sha256(body)
+        path.chmod(0o644)
+        path.write_bytes(body + digest.digest())
+
+    def test_a_forged_commit_graph_cannot_cut_away_a_public_ancestor(self) -> None:
+        """A checksum-valid commit-graph whose parent slots were blanked is not history."""
+        self._deleted_public_history()
+        self._forge_commit_graph_roots()
+        count = subprocess.run(
+            [_GIT, "rev-list", "--count", "HEAD"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(count, "1")  # the fixture really does fool plain git
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_an_object_whose_bytes_do_not_match_its_id_is_not_trusted(self) -> None:
+        """A loose public-declaration blob rewritten to say private is corruption, not history."""
+        self._deleted_public_history()
+        oid = self._rev("HEAD~2:publication.toml")
+        loose = self.root / ".git" / "objects" / oid[:2] / oid[2:]
+        body = self._declare("private-until-review").encode()
+        loose.chmod(0o644)
+        loose.write_bytes(zlib.compress(b"blob %d\0" % len(body) + body))
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_dangling_history_under_a_broken_head_is_not_unborn(self) -> None:
+        """HEAD unresolvable and every ref deleted: the commits are still there."""
+        self._deleted_public_history()
+        branch = subprocess.run(
+            [_GIT, "symbolic-ref", "HEAD"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self._git("symbolic-ref", "HEAD", "refs/heads/unborn")
+        self._git("update-ref", "-d", branch)
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_an_orphan_branch_with_its_own_commit_is_still_the_public_repo(self) -> None:
+        """A fresh root cut from a public repo is judged with the repo's other refs."""
+        self._deleted_public_history()
+        self._git("checkout", "-q", "--orphan", "fresh-start")
+        self._git("commit", "-q", "--no-verify", "-m", "fresh root, no declaration")
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_an_orphan_branch_in_a_private_repo_is_still_fine(self) -> None:
+        """Control: when every ref's last declaration is cleanly private, absence skips."""
+        self._run(self._declare("private-until-review"))
+        self._git("rm", "-q", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "opt out")
+        self._git("checkout", "-q", "--orphan", "fresh-start")
+        self._git("commit", "-q", "--no-verify", "--allow-empty", "-m", "fresh root")
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 # The subclass exists for its own tests; do not run the inherited ones twice.

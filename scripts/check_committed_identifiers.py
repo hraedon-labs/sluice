@@ -469,43 +469,33 @@ def _text_declares_private(text: str) -> bool:
     return declared.strip().casefold() == "private-until-review"
 
 
-def _absent_declaration_verdict() -> bool:
-    """Verdict for a repo whose declaration is ABSENT: False, unless that is unsafe.
+# Every history read on the absence path ignores replace refs and the
+# commit-graph cache: both rewrite the parent graph without touching a commit
+# object, and the walk below would trust either. (Bare "git" first, as _run_git
+# passes it.)
+_HISTORY_GIT = ["git", "--no-replace-objects", "-c", "core.commitGraph=false"]
 
-    Absence is the "never opted in" skip. But deleting a declaration that said
-    public does not make the remote private: it only disarms the gate. So the
-    whole history decides, not one log query: a commit WITH a declaration is safe
-    only if it cleanly says "private-until-review"; a commit WITHOUT one is safe
-    only if every parent is safe (a root commit without one is safe -- never opted
-    in). The state being judged (the index or worktree with no declaration) has
-    HEAD as its parent, so absence is a skip exactly when HEAD is safe. This covers
-    plain and merge deletions, laundering through an invalid declaration, and a
-    merge that joins an unsafe absent lineage to a private one. To leave the
-    publication system, declare "private-until-review" and remove the file in a
-    later commit.
 
-    A history the gate cannot see whole is refused, not judged. A shallow clone
-    hides commits beyond its graft and the graft would count as a root, so a
-    declaration deleted in an unfetched commit read as "never opted in" -- exit 0
-    on a public repo (actions/checkout is shallow by default). A partial clone
-    (--filter) or any repo missing objects answers "missing" for a declaration
-    blob it does not have, the same answer as a commit without one. Replace refs
-    and a grafts file rewrite the parent graph the walk reads; the walk ignores
-    replace refs and a grafts file is refused.
+def _history_run(args: list[str], stdin: bytes | None = None) -> bytes:
+    """Run a history-reading git command (see _HISTORY_GIT); a failure is a GateError."""
+    try:
+        return subprocess.run(
+            [*_HISTORY_GIT, *args], input=stdin, capture_output=True, check=True
+        ).stdout
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise GateError(f"could not read the declaration history ({exc})") from exc
+
+
+def _require_whole_history() -> None:
+    """Refuse, rather than judge, a history the gate cannot see whole or trust.
+
+    Each check closes a demonstrated exit 0 on a public repo with no denylist:
+    a shallow clone (the graft read as a root; actions/checkout is shallow by
+    default); a grafts file (rewrites parents); a partial/--filter clone (a
+    declaration blob it does not have answers "missing", the same as no
+    declaration); and objects whose bytes do not match their id or a forged
+    commit-graph (git fsck verifies both; the walk itself verifies neither).
     """
-    if _git_or_none(["git", "rev-parse", "--verify", "-q", "HEAD"]) is None:
-        # Genuinely unborn only when the repository has no commits at all (the
-        # first commit). A HEAD that does not resolve in a repository WITH history
-        # -- a broken symref, an orphan branch cut from a public lineage -- would
-        # otherwise read as a safe root and launder the deletion.
-        if _run_git(["git", "rev-list", "--all", "--max-count=1"]).strip():
-            raise GateError(
-                f"{_DECLARATION_FILENAME} is absent and HEAD does not resolve, but this "
-                "repository has history; the gate cannot tell whether it was ever "
-                "declared public, so it will not treat it as never opted in. Restore "
-                "the declaration, or check out a branch."
-            )
-        return False
     # Anything but a literal "false" (including a git too old to know the flag,
     # which echoes it back) is treated as shallow.
     if _run_git(["git", "rev-parse", "--is-shallow-repository"]).strip() != "false":
@@ -524,19 +514,8 @@ def _absent_declaration_verdict() -> bool:
             "declared public; the gate will not judge it. Remove the grafts file, or "
             "restore the declaration."
         )
-    objects_argv = [
-        "git",
-        "--no-replace-objects",
-        "rev-list",
-        "--objects",
-        "--missing=print",
-        "HEAD",
-    ]
-    try:
-        objects = subprocess.run(objects_argv, capture_output=True, check=True).stdout
-    except (subprocess.CalledProcessError, OSError) as exc:
-        raise GateError(f"could not read the declaration history ({exc})") from exc
-    if any(line.startswith(b"?") for line in objects.splitlines()):
+    listing = _history_run(["rev-list", "--objects", "--missing=print", "HEAD", "--all"])
+    if any(line.startswith(b"?") for line in listing.splitlines()):
         raise GateError(
             f"{_DECLARATION_FILENAME} is absent and this clone is missing objects "
             "(a partial/--filter clone, or a damaged repository), so a missing "
@@ -544,36 +523,76 @@ def _absent_declaration_verdict() -> bool:
             "treat it as never opted in. Use a full clone (no --filter), or restore "
             "the declaration."
         )
+    # fsck with the default config, so a commit-graph present is verified too.
+    fsck_argv = ["git", "--no-replace-objects", "fsck", "--full", "--no-dangling", "--no-progress"]
+    try:
+        subprocess.run(fsck_argv, capture_output=True, check=True)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is absent and this repository fails git fsck "
+            f"({exc}); a history whose objects do not verify cannot decide whether "
+            "it was ever declared public, so the gate will not treat it as never "
+            "opted in. Repair the repository (or re-clone), or restore the declaration."
+        ) from exc
+
+
+def _absent_declaration_verdict() -> bool:
+    """Verdict for a repo whose declaration is ABSENT: False, unless that is unsafe.
+
+    Absence is the "never opted in" skip. But deleting a declaration that said
+    public does not make the remote private: it only disarms the gate. So the
+    whole history decides, not one log query: a commit WITH a declaration is safe
+    only if it cleanly says "private-until-review"; a commit WITHOUT one is safe
+    only if every parent is safe (a root commit without one is safe -- never opted
+    in). The state being judged (the index or worktree with no declaration) has
+    HEAD as its parent, so absence is a skip exactly when HEAD is safe -- and,
+    since an orphan branch or a fresh root cut from a public repo is still that
+    public repo, only when every other ref's tip is safe too. This covers plain
+    and merge deletions, laundering through an invalid declaration, a merge that
+    joins an unsafe absent lineage to a private one, and orphan branches. To leave
+    the publication system, declare "private-until-review" and remove the file in
+    a later commit.
+
+    A history the gate cannot see whole or trust is refused, not judged (see
+    _require_whole_history).
+    """
+    if _git_or_none(["git", "rev-parse", "--verify", "-q", "HEAD"]) is None:
+        # Genuinely unborn only when the object database holds no commit at all
+        # (the first commit). A HEAD that does not resolve in a repository WITH
+        # history -- a broken symref, an orphan branch, refs deleted so the
+        # lineage is dangling -- would otherwise read as a safe root.
+        kinds = _history_run(["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"])
+        if b"commit" in kinds.split():
+            raise GateError(
+                f"{_DECLARATION_FILENAME} is absent and HEAD does not resolve, but this "
+                "repository holds commits; the gate cannot tell whether it was ever "
+                "declared public, so it will not treat it as never opted in. Restore "
+                "the declaration, or check out a branch."
+            )
+        return False
+    _require_whole_history()
     graph: dict[str, list[str]] = {}
     order: list[str] = []
-    walk = ["git", "--no-replace-objects", "rev-list", "--topo-order", "--parents", "HEAD"]
-    for line in _run_git(walk).splitlines():
+    walk = _history_run(["rev-list", "--topo-order", "--parents", "HEAD", "--all"])
+    for line in walk.decode("ascii", "replace").splitlines():
         if line.strip():
             commit, *parents = line.split()
             graph[commit] = parents
             order.append(commit)
-    head = order[0]
-    # Bare "git", as _run_git passes it: the argv is a variable, as there.
+    head = _run_git(["git", "rev-parse", "--verify", "HEAD^{commit}"]).strip()
+    parented = {p for parents in graph.values() for p in parents}
+    tips = [c for c in order if c not in parented]
     # %(objectmode) (git >= 2.45): a symlink or gitlink at publication.toml is
     # reported as a blob too, and its target string could read as a private
     # declaration. Only a regular file is a declaration, as on every other path.
-    check_argv = [
-        "git",
-        "--no-replace-objects",
-        "cat-file",
-        "--batch-check=%(objectmode) %(objecttype) %(objectname)",
-    ]
-    batch_argv = ["git", "--no-replace-objects", "cat-file", "--batch"]
-    try:
-        check_proc = subprocess.run(
-            check_argv,
-            input="".join(f"{c}:{_DECLARATION_FILENAME}\n" for c in order).encode(),
-            capture_output=True,
-            check=True,
+    checked = (
+        _history_run(
+            ["cat-file", "--batch-check=%(objectmode) %(objecttype) %(objectname)"],
+            "".join(f"{c}:{_DECLARATION_FILENAME}\n" for c in order).encode(),
         )
-    except (subprocess.CalledProcessError, OSError) as exc:
-        raise GateError(f"could not read the declaration history ({exc})") from exc
-    checked = check_proc.stdout.decode("utf-8", "replace").splitlines()
+        .decode("utf-8", "replace")
+        .splitlines()
+    )
     if len(checked) != len(order):
         raise GateError("could not read the declaration history (short batch-check output)")
     present: dict[str, str | None] = {}
@@ -588,15 +607,7 @@ def _absent_declaration_verdict() -> bool:
     blobs = sorted({oid for oid in present.values() if oid})
     private_blob: dict[str, bool] = {}
     if blobs:
-        try:
-            out = subprocess.run(
-                batch_argv,
-                input="".join(f"{oid}\n" for oid in blobs).encode(),
-                capture_output=True,
-                check=True,
-            ).stdout
-        except (subprocess.CalledProcessError, OSError) as exc:
-            raise GateError(f"could not read the declaration history ({exc})") from exc
+        out = _history_run(["cat-file", "--batch"], "".join(f"{oid}\n" for oid in blobs).encode())
         pos = 0
         for oid in blobs:
             header_end = out.index(b"\n", pos)
@@ -614,14 +625,14 @@ def _absent_declaration_verdict() -> bool:
             safe[commit] = bool(entry) and private_blob.get(entry, False)
         else:
             safe[commit] = all(safe.get(p, True) for p in graph[commit])
-    if safe[head]:
+    if safe.get(head, False) and all(safe[t] for t in tips):
         return False
     raise GateError(
-        f"{_DECLARATION_FILENAME} is absent, but this history declared a visibility "
-        'other than "private-until-review" without a later clean private '
-        "declaration; removing a declaration does not make the remote private, so "
-        "the gate will not treat it as never opted in. Restore it, or declare "
-        '"private-until-review" before removing it.'
+        f"{_DECLARATION_FILENAME} is absent, but this repository's history declared a "
+        'visibility other than "private-until-review" (on this branch, or on another '
+        "ref) without a later clean private declaration; removing a declaration does "
+        "not make the remote private, so the gate will not treat it as never opted "
+        'in. Restore it, or declare "private-until-review" before removing it.'
     )
 
 
