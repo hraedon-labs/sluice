@@ -349,7 +349,9 @@ def collect_staged_paths() -> list[Path]:
 
     Scans only what is about to be committed rather than the whole tree, so the
     local gate is fast enough to run on every commit. Deletions are excluded
-    (``--diff-filter=ACM``) because there is nothing to scan. ``--no-renames``
+    (``--diff-filter=ACMT``) because there is nothing to scan. Type changes (T) ARE
+    included: re-staging a regular file as a symlink whose target names a forbidden
+    identifier is otherwise invisible to the hook. ``--no-renames``
     decomposes renames into add+delete so the new path (e.g. a file moved into
     ``samples/``) is included as an addition and caught by the always-on guard.
     """
@@ -359,7 +361,7 @@ def collect_staged_paths() -> list[Path]:
             "diff",
             "--cached",
             "--name-only",
-            "--diff-filter=ACM",
+            "--diff-filter=ACMT",
             "--no-renames",
             "-z",
         ]
@@ -432,6 +434,11 @@ def _git_or_none(args: list[str]) -> str | None:
         return _run_git(args)
     except GateError:
         return None
+    except UnicodeDecodeError:
+        # Present but not UTF-8 text: never a clean "private-until-review", and
+        # must not read as "absent" either, or a corrupt last declaration would
+        # launder a public one. A non-empty non-declaration says exactly that.
+        return "\ufffd"
 
 
 def _text_declares_private(text: str) -> bool:
@@ -452,59 +459,93 @@ def _text_declares_private(text: str) -> bool:
 
 
 def _absent_declaration_verdict() -> bool:
-    """Verdict for a repo whose declaration is ABSENT: False, unless it was removed.
+    """Verdict for a repo whose declaration is ABSENT: False, unless that is unsafe.
 
     Absence is the "never opted in" skip. But deleting a declaration that said
-    public does not make the remote private: it only disarmed the gate (the
-    missing-denylist refusal became a skip). So unless the last declaration this
-    history recorded -- in HEAD, or in every parent of the commit that deleted it
-    -- cleanly said "private-until-review", absence is an error. To leave the
-    publication system, declare
-    "private-until-review" first and remove the file in a later commit.
+    public does not make the remote private: it only disarms the gate. So the
+    whole history decides, not one log query: a commit WITH a declaration is safe
+    only if it cleanly says "private-until-review"; a commit WITHOUT one is safe
+    only if every parent is safe (a root commit without one is safe -- never opted
+    in). The state being judged (the index or worktree with no declaration) has
+    HEAD as its parent, so absence is a skip exactly when HEAD is safe. This covers
+    plain and merge deletions, laundering through an invalid declaration, and a
+    merge that joins an unsafe absent lineage to a private one. To leave the
+    publication system, declare "private-until-review" and remove the file in a
+    later commit.
 
-    Best effort on shallow clones: a deletion older than the fetched history is
-    invisible here, and then the absence skip applies as before.
+    Best effort on shallow clones: history beyond the graft is invisible here and
+    the shallow root counts as a root.
     """
-    priors: list[str] = []
-    if _git_or_none(["git", "rev-parse", "--verify", "-q", "HEAD"]) is not None:
-        head_copy = _git_or_none(["git", "show", f"HEAD:{_DECLARATION_FILENAME}"])
-        if head_copy is not None:
-            priors.append(head_copy)
+    if _git_or_none(["git", "rev-parse", "--verify", "-q", "HEAD"]) is None:
+        return False
+    graph: dict[str, list[str]] = {}
+    order: list[str] = []
+    for line in _run_git(["git", "rev-list", "--topo-order", "--parents", "HEAD"]).splitlines():
+        if line.strip():
+            commit, *parents = line.split()
+            graph[commit] = parents
+            order.append(commit)
+    head = order[0]
+    # Bare "git", as _run_git passes it: the argv is a variable, as there.
+    check_argv = ["git", "cat-file", "--batch-check"]
+    batch_argv = ["git", "cat-file", "--batch"]
+    try:
+        checked = subprocess.run(
+            check_argv,
+            input="".join(f"{c}:{_DECLARATION_FILENAME}\n" for c in order).encode(),
+            capture_output=True,
+            check=True,
+        ).stdout.decode("utf-8", "replace").splitlines()
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise GateError(f"could not read the declaration history ({exc})") from exc
+    if len(checked) != len(order):
+        raise GateError("could not read the declaration history (short batch-check output)")
+    present: dict[str, str | None] = {}
+    for commit, row in zip(order, checked, strict=True):
+        fields = row.split()
+        if row.endswith(" missing") or len(fields) != 3:
+            present[commit] = None
+        elif fields[1] != "blob":
+            present[commit] = ""  # present but not a file: never a clean private
         else:
-            # -m --full-history: without them git log does not report a MERGE that
-            # deleted the file when both parents still had it (a conflict resolved
-            # by deletion). Every parent's copy counts: a public one in any parent
-            # was deleted by this commit.
-            deleted_in = (
-                _git_or_none(
-                    [
-                        "git",
-                        "log",
-                        "-1",
-                        "-m",
-                        "--full-history",
-                        "--format=%H %P",
-                        "--diff-filter=D",
-                        "HEAD",
-                        "--",
-                        f":(top,literal){_DECLARATION_FILENAME}",
-                    ]
-                )
-                or ""
-            ).splitlines()
-            # -m prints the commit once per parent; the first line names them all.
-            parents = deleted_in[0].split()[1:] if deleted_in else []
-            for parent in parents:
-                copy = _git_or_none(["git", "show", f"{parent}:{_DECLARATION_FILENAME}"])
-                if copy is not None:
-                    priors.append(copy)
-    if all(_text_declares_private(copy) for copy in priors):
+            present[commit] = fields[0]
+    blobs = sorted({oid for oid in present.values() if oid})
+    private_blob: dict[str, bool] = {}
+    if blobs:
+        try:
+            out = subprocess.run(
+                batch_argv,
+                input="".join(f"{oid}\n" for oid in blobs).encode(),
+                capture_output=True,
+                check=True,
+            ).stdout
+        except (subprocess.CalledProcessError, OSError) as exc:
+            raise GateError(f"could not read the declaration history ({exc})") from exc
+        pos = 0
+        for oid in blobs:
+            header_end = out.index(b"\n", pos)
+            size = int(out[pos:header_end].split()[2])
+            data = out[header_end + 1 : header_end + 1 + size]
+            pos = header_end + 1 + size + 1
+            try:
+                private_blob[oid] = _text_declares_private(data.decode("utf-8"))
+            except UnicodeDecodeError:
+                private_blob[oid] = False
+    safe: dict[str, bool] = {}
+    for commit in reversed(order):  # --topo-order lists children first
+        oid = present[commit]
+        if oid is not None:
+            safe[commit] = bool(oid) and private_blob.get(oid, False)
+        else:
+            safe[commit] = all(safe.get(p, True) for p in graph[commit])
+    if safe[head]:
         return False
     raise GateError(
-        f"{_DECLARATION_FILENAME} is absent, but the last declaration in this history "
-        'was not visibility="private-until-review"; removing a declaration does not '
-        "make the remote private, so the gate will not treat it as never opted in. "
-        'Restore it, or declare "private-until-review" before removing it.'
+        f"{_DECLARATION_FILENAME} is absent, but this history declared a visibility "
+        'other than "private-until-review" without a later clean private '
+        "declaration; removing a declaration does not make the remote private, so "
+        "the gate will not treat it as never opted in. Restore it, or declare "
+        '"private-until-review" before removing it.'
     )
 
 
@@ -756,10 +797,16 @@ def _scan_index_snapshot(identifiers: frozenset[str], paths: list[Path], **kwarg
         for name, data in blobs.items():
             target = base / name
             target.parent.mkdir(parents=True, exist_ok=True)
-            if entries[name][0] == "120000":
-                os.symlink(os.fsdecode(data), target)
-            else:
-                target.write_bytes(data)
+            try:
+                if entries[name][0] == "120000":
+                    os.symlink(os.fsdecode(data), target)
+                else:
+                    target.write_bytes(data)
+            except OSError as exc:
+                raise GateError(
+                    f"could not materialise the staged entry {name!r} to scan it ({exc}); "
+                    "the gate will not pass a commit it could not fully scan."
+                ) from exc
 
         def back(p: Path) -> Path:
             try:

@@ -362,6 +362,19 @@ class DeclarationSourceContract(VisibilityContract):
         result = self._gate("--staged", denylist="zzzsynthetictoken")
         self.assertEqual(result.returncode, 1, result.stderr)
 
+    def test_staged_type_change_to_a_token_bearing_symlink_is_caught(self) -> None:
+        """Regular file re-staged as a symlink is a type change (T), not A/C/M."""
+        self._run(self._declare("private-until-review"))
+        link = self.root / "notes.txt"
+        link.write_text("clean\n", encoding="utf-8")
+        self._git("add", "notes.txt")
+        self._git("commit", "-q", "--no-verify", "-m", "regular file")
+        link.unlink()
+        link.symlink_to("zzzsynthetictoken.example.invalid")
+        self._git("add", "notes.txt")
+        result = self._gate("--staged", denylist="zzzsynthetictoken")
+        self.assertEqual(result.returncode, 1, result.stderr)
+
     # -- removing a public declaration is not "never opted in" ----------------
 
     def test_removing_a_public_declaration_does_not_disarm_the_gate(self) -> None:
@@ -423,6 +436,69 @@ class DeclarationSourceContract(VisibilityContract):
                 self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
                 result = self._gate()
                 self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_a_non_utf8_last_declaration_is_not_an_opt_out(self) -> None:
+        """A corrupt last declaration must not launder a public one into absence."""
+        self._run(self._declare("public"))
+        (self.root / "publication.toml").write_bytes(
+            b'[publication]\nvisibility = "private-until-review"\n# \xff\n'
+        )
+        self._git("add", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "corrupt")
+        self._git("rm", "-q", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
+        result = self._gate()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("private-until-review", result.stderr)
+
+    def test_a_private_branch_cannot_launder_a_deleted_public_lineage(self) -> None:
+        """Base, then (public, deleted) merged with (private) into an absent merge."""
+        self._run(None)
+        self._git("checkout", "-q", "-b", "public-line")
+        self._run(self._declare("public"))
+        self._git("rm", "-q", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "delete public")
+        self._git("checkout", "-q", "-")
+        self._run(self._declare("private-until-review"))
+        merge = subprocess.run(
+            [
+                _GIT,
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "user.name=Test",
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                "public-line",
+            ],
+            cwd=self.root,
+            env=_clean_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if (self.root / "publication.toml").exists():
+            self._git("rm", "-q", "-f", "publication.toml")
+        self.assertIn(merge.returncode, (0, 1), merge.stderr)
+        # The MERGE commit itself records no declaration: one parent is private,
+        # the other is an absent lineage whose last declaration was public.
+        self._git("commit", "-q", "--no-verify", "-m", "merge, declaration absent")
+        self.assertEqual(
+            len(
+                subprocess.run(
+                    [_GIT, "rev-list", "--parents", "-1", "HEAD"],
+                    cwd=self.root,
+                    env=_clean_env(),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.split()
+            ),
+            3,
+        )
+        result = self._gate()
+        self.assertEqual(result.returncode, 1, result.stderr)
 
     def test_removing_a_private_declaration_is_a_clean_opt_out(self) -> None:
         """Leaving the publication system is allowed once the declaration said private."""
