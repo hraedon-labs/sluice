@@ -920,6 +920,100 @@ class DeclarationSourceContract(VisibilityContract):
             result = self._gate(*args)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def _break_head_and_drop_refs(self) -> None:
+        """Point HEAD at a missing branch and delete every ref (history left dangling)."""
+        refs = subprocess.run(
+            [_GIT, "for-each-ref", "--format=%(refname)"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        self._git("symbolic-ref", "HEAD", "refs/heads/unborn")
+        for ref in refs:
+            self._git("update-ref", "-d", ref)
+
+    def test_a_damaged_object_store_is_not_an_unborn_repo(self) -> None:
+        """Commits disguised as blobs, a pack without its index, or a foreign object dir."""
+        for how in ("commits rewritten as blobs", "pack index removed", "GIT_OBJECT_DIRECTORY"):
+            with self.subTest(how=how):
+                self._fresh()
+                self._deleted_public_history()
+                objects = self.root / ".git" / "objects"
+                commits = subprocess.run(
+                    [_GIT, "rev-list", "--all"],
+                    cwd=self.root,
+                    env=self._env(),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.split()
+                if how == "pack index removed":
+                    self._git("repack", "-adq")
+                    self._git("prune-packed")
+                self._break_head_and_drop_refs()
+                env_extra: dict[str, str] = {}
+                if how == "commits rewritten as blobs":
+                    for oid in commits:
+                        loose = objects / oid[:2] / oid[2:]
+                        loose.chmod(0o644)
+                        loose.write_bytes(zlib.compress(b"blob 1\0x"))
+                elif how == "pack index removed":
+                    for idx in (objects / "pack").glob("*.idx"):
+                        idx.chmod(0o644)
+                        idx.unlink()
+                else:
+                    empty = Path(self._tmp.name) / f"empty-objects{self._count}"
+                    empty.mkdir()
+                    env_extra["GIT_OBJECT_DIRECTORY"] = str(empty)
+                for args in ((), ("--staged",)):
+                    env = self._env()
+                    env.update(env_extra)
+                    result = subprocess.run(
+                        [sys.executable, str(GATE), *args],
+                        cwd=self.root,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_old_public_refs_and_stashes_do_not_block_a_clean_opt_out(self) -> None:
+        """public, then cleanly private, then removed: a public-era tag or stash is superseded."""
+        for keep in ("tag at the public commit", "stash made while public"):
+            with self.subTest(keep=keep):
+                self._fresh()
+                self._run(self._declare("public"))
+                if keep == "tag at the public commit":
+                    self._git("tag", "v-public")
+                else:
+                    (self.root / "README.md").write_text("work in progress\n", encoding="utf-8")
+                    self._git("stash", "push", "-q")
+                self._run(self._declare("private-until-review"))
+                self._git("rm", "-q", "publication.toml")
+                self._git("commit", "-q", "--no-verify", "-m", "opt out")
+                for args in ((), ("--staged",)):
+                    result = self._gate(*args)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_public_side_branch_still_counts(self) -> None:
+        """A ref that is NOT an ancestor of the opt-out (here a public side branch) is a tip."""
+        self._run(self._declare("public"))
+        self._git("branch", "still-public")
+        self._run(self._declare("private-until-review"))
+        self._git("checkout", "-q", "still-public")
+        (self.root / "side.txt").write_text("side\n", encoding="utf-8")
+        self._run(None)
+        self._git("checkout", "-q", "-")
+        self._git("rm", "-q", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "opt out")
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
 
 # The subclass exists for its own tests; do not run the inherited ones twice.
 for _name in [n for n in vars(VisibilityContract) if n.startswith("test_")]:

@@ -523,6 +523,24 @@ def _require_whole_history() -> None:
             "treat it as never opted in. Use a full clone (no --filter), or restore "
             "the declaration."
         )
+    _require_verified_objects()
+
+
+def _require_verified_objects() -> None:
+    """Refuse an object store git fsck does not verify, or one selected by the environment.
+
+    Runs before every absence verdict, the "unborn" one included: commits
+    rewritten as blobs, a pack whose index was removed, or GIT_OBJECT_DIRECTORY
+    pointed at an empty store all made a repository WITH history look like one
+    with no commits (exit 0).
+    """
+    for var in ("GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        if os.environ.get(var):
+            raise GateError(
+                f"{_DECLARATION_FILENAME} is absent and {var} is set, so the history the "
+                "gate would judge is not this repository's own object store; unset it, "
+                "or restore the declaration."
+            )
     # fsck with the default config, so a commit-graph present is verified too.
     fsck_argv = ["git", "--no-replace-objects", "fsck", "--full", "--no-dangling", "--no-progress"]
     try:
@@ -547,7 +565,18 @@ def _absent_declaration_verdict() -> bool:
     in). The state being judged (the index or worktree with no declaration) has
     HEAD as its parent, so absence is a skip exactly when HEAD is safe -- and,
     since an orphan branch or a fresh root cut from a public repo is still that
-    public repo, only when every other ref's tip is safe too. This covers plain
+    public repo, only when every tip of the graph of HEAD and all refs (local,
+    remote-tracking, tags; not refs/stash, a local snapshot) is safe too. A tip
+    is a commit no other walked commit descends from: a ref at an ANCESTOR of a
+    clean private declaration is superseded by it, which is what lets a repo
+    with old public-era tags leave the publication system.
+
+    Limit, stated plainly: a lineage whose every ref was deleted locally is not
+    judged. Whether its commits are still in the object database depends on
+    garbage collection (git gc --prune makes the state indistinguishable from a
+    repo that never had them), and counting dangling commits would refuse
+    ordinary rebased-away and dropped-stash history. CI judges a fresh full
+    clone, which carries the remote's refs. This covers plain
     and merge deletions, laundering through an invalid declaration, a merge that
     joins an unsafe absent lineage to a private one, and orphan branches. To leave
     the publication system, declare "private-until-review" and remove the file in
@@ -557,6 +586,7 @@ def _absent_declaration_verdict() -> bool:
     _require_whole_history).
     """
     if _git_or_none(["git", "rev-parse", "--verify", "-q", "HEAD"]) is None:
+        _require_verified_objects()
         # Genuinely unborn only when the object database holds no commit at all
         # (the first commit). A HEAD that does not resolve in a repository WITH
         # history -- a broken symref, an orphan branch, refs deleted so the
@@ -573,7 +603,9 @@ def _absent_declaration_verdict() -> bool:
     _require_whole_history()
     graph: dict[str, list[str]] = {}
     order: list[str] = []
-    walk = _history_run(["rev-list", "--topo-order", "--parents", "HEAD", "--all"])
+    walk = _history_run(
+        ["rev-list", "--topo-order", "--parents", "HEAD", "--exclude=refs/stash", "--all"]
+    )
     for line in walk.decode("ascii", "replace").splitlines():
         if line.strip():
             commit, *parents = line.split()
