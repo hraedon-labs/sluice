@@ -440,15 +440,17 @@ def _staged_declaration_text() -> str | None:
 
 def _git_or_none(args: list[str]) -> str | None:
     """Return the stdout of a git command, or None when it fails (optional lookups)."""
+    # No UnicodeDecodeError arm. The only caller asks `rev-parse --verify -q HEAD`,
+    # whose stdout is a hex object id or nothing and whose stderr -q silences, so
+    # no locale codec can fail on it. An arm here used to return a non-None
+    # placeholder; were it ever reached, that would CONTINUE the absence verdict,
+    # so dropping it can only turn such a case into an exit 1, never a pass. Do
+    # not translate UnicodeDecodeError into GateError either: here that would read
+    # as "no HEAD", which is the never-opted-in skip.
     try:
         return _run_git(args)
     except GateError:
         return None
-    except UnicodeDecodeError:
-        # Present but not UTF-8 text: never a clean "private-until-review", and
-        # must not read as "absent" either, or a corrupt last declaration would
-        # launder a public one. A non-empty non-declaration says exactly that.
-        return "\ufffd"
 
 
 def _text_declares_private(text: str) -> bool:
@@ -483,11 +485,23 @@ def _absent_declaration_verdict() -> bool:
     publication system, declare "private-until-review" and remove the file in a
     later commit.
 
-    Best effort on shallow clones: history beyond the graft is invisible here and
-    the shallow root counts as a root.
+    A shallow clone is refused, not judged: history beyond the graft is invisible
+    and the graft would count as a root, so a declaration deleted in an unfetched
+    commit read as "never opted in" -- exit 0 on a public repo. actions/checkout
+    is shallow by default, so this was the CI default, not a corner case.
     """
     if _git_or_none(["git", "rev-parse", "--verify", "-q", "HEAD"]) is None:
         return False
+    # Anything but a literal "false" (including a git too old to know the flag,
+    # which echoes it back) is treated as shallow.
+    if _run_git(["git", "rev-parse", "--is-shallow-repository"]).strip() != "false":
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is absent and this is a shallow clone, so the "
+            "history that decides whether it was ever declared public cannot be "
+            "read; the gate will not treat it as never opted in. Fetch full "
+            "history (git fetch --unshallow; in CI, actions/checkout with "
+            "fetch-depth: 0), or restore the declaration."
+        )
     graph: dict[str, list[str]] = {}
     order: list[str] = []
     for line in _run_git(["git", "rev-list", "--topo-order", "--parents", "HEAD"]).splitlines():
