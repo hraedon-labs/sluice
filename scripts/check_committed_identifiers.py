@@ -440,13 +440,12 @@ def _staged_declaration_text() -> str | None:
 
 def _git_or_none(args: list[str]) -> str | None:
     """Return the stdout of a git command, or None when it fails (optional lookups)."""
-    # No UnicodeDecodeError arm. The only caller asks `rev-parse --verify -q HEAD`,
-    # whose stdout is a hex object id or nothing and whose stderr -q silences, so
-    # no locale codec can fail on it. An arm here used to return a non-None
-    # placeholder; were it ever reached, that would CONTINUE the absence verdict,
-    # so dropping it can only turn such a case into an exit 1, never a pass. Do
-    # not translate UnicodeDecodeError into GateError either: here that would read
-    # as "no HEAD", which is the never-opted-in skip.
+    # No UnicodeDecodeError arm: unreachable in practice. The only caller asks
+    # `rev-parse --verify -q HEAD`, whose stdout is a hex object id or nothing and
+    # whose stderr -q silences. Were a decode error ever raised here it now
+    # propagates and the gate exits 1. Do not translate it into GateError: that
+    # would read as "no HEAD", which is the never-opted-in skip. Re-check this
+    # before adding a caller.
     try:
         return _run_git(args)
     except GateError:
@@ -485,12 +484,27 @@ def _absent_declaration_verdict() -> bool:
     publication system, declare "private-until-review" and remove the file in a
     later commit.
 
-    A shallow clone is refused, not judged: history beyond the graft is invisible
-    and the graft would count as a root, so a declaration deleted in an unfetched
-    commit read as "never opted in" -- exit 0 on a public repo. actions/checkout
-    is shallow by default, so this was the CI default, not a corner case.
+    A history the gate cannot see whole is refused, not judged. A shallow clone
+    hides commits beyond its graft and the graft would count as a root, so a
+    declaration deleted in an unfetched commit read as "never opted in" -- exit 0
+    on a public repo (actions/checkout is shallow by default). A partial clone
+    (--filter) or any repo missing objects answers "missing" for a declaration
+    blob it does not have, the same answer as a commit without one. Replace refs
+    and a grafts file rewrite the parent graph the walk reads; the walk ignores
+    replace refs and a grafts file is refused.
     """
     if _git_or_none(["git", "rev-parse", "--verify", "-q", "HEAD"]) is None:
+        # Genuinely unborn only when the repository has no commits at all (the
+        # first commit). A HEAD that does not resolve in a repository WITH history
+        # -- a broken symref, an orphan branch cut from a public lineage -- would
+        # otherwise read as a safe root and launder the deletion.
+        if _run_git(["git", "rev-list", "--all", "--max-count=1"]).strip():
+            raise GateError(
+                f"{_DECLARATION_FILENAME} is absent and HEAD does not resolve, but this "
+                "repository has history; the gate cannot tell whether it was ever "
+                "declared public, so it will not treat it as never opted in. Restore "
+                "the declaration, or check out a branch."
+            )
         return False
     # Anything but a literal "false" (including a git too old to know the flag,
     # which echoes it back) is treated as shallow.
@@ -502,9 +516,38 @@ def _absent_declaration_verdict() -> bool:
             "history (git fetch --unshallow; in CI, actions/checkout with "
             "fetch-depth: 0), or restore the declaration."
         )
+    grafts = _run_git(["git", "rev-parse", "--git-path", "info/grafts"]).strip()
+    if os.path.lexists(grafts):
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is absent and this repository has a grafts file "
+            f"({grafts}), which rewrites the history that decides whether it was ever "
+            "declared public; the gate will not judge it. Remove the grafts file, or "
+            "restore the declaration."
+        )
+    objects_argv = [
+        "git",
+        "--no-replace-objects",
+        "rev-list",
+        "--objects",
+        "--missing=print",
+        "HEAD",
+    ]
+    try:
+        objects = subprocess.run(objects_argv, capture_output=True, check=True).stdout
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise GateError(f"could not read the declaration history ({exc})") from exc
+    if any(line.startswith(b"?") for line in objects.splitlines()):
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is absent and this clone is missing objects "
+            "(a partial/--filter clone, or a damaged repository), so a missing "
+            "declaration cannot be told from an unavailable one; the gate will not "
+            "treat it as never opted in. Use a full clone (no --filter), or restore "
+            "the declaration."
+        )
     graph: dict[str, list[str]] = {}
     order: list[str] = []
-    for line in _run_git(["git", "rev-list", "--topo-order", "--parents", "HEAD"]).splitlines():
+    walk = ["git", "--no-replace-objects", "rev-list", "--topo-order", "--parents", "HEAD"]
+    for line in _run_git(walk).splitlines():
         if line.strip():
             commit, *parents = line.split()
             graph[commit] = parents
@@ -514,8 +557,13 @@ def _absent_declaration_verdict() -> bool:
     # %(objectmode) (git >= 2.45): a symlink or gitlink at publication.toml is
     # reported as a blob too, and its target string could read as a private
     # declaration. Only a regular file is a declaration, as on every other path.
-    check_argv = ["git", "cat-file", "--batch-check=%(objectmode) %(objecttype) %(objectname)"]
-    batch_argv = ["git", "cat-file", "--batch"]
+    check_argv = [
+        "git",
+        "--no-replace-objects",
+        "cat-file",
+        "--batch-check=%(objectmode) %(objecttype) %(objectname)",
+    ]
+    batch_argv = ["git", "--no-replace-objects", "cat-file", "--batch"]
     try:
         check_proc = subprocess.run(
             check_argv,

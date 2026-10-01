@@ -744,6 +744,91 @@ class DeclarationSourceContract(VisibilityContract):
                 if visibility == "public":
                     self.assertNotIn("shallow", result.stderr)
 
+    # -- a history the gate cannot see whole is refused ------------------------
+
+    def _deleted_public_history(self) -> None:
+        """public declaration, then deleted, then a later commit (no denylist)."""
+        self._run(self._declare("public"))
+        self._git("rm", "-q", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
+        self._git("commit", "-q", "--no-verify", "--allow-empty", "-m", "later")
+
+    def test_partial_clone_cannot_launder_a_deleted_public_declaration(self) -> None:
+        """A --filter=blob:none clone lacks the declaration blob: "missing" is not absence."""
+        self._deleted_public_history()
+        self._git("config", "uploadpack.allowFilter", "true")
+        source = self.root
+        clone = Path(self._tmp.name) / f"partial{self._count}"
+        subprocess.run(
+            [
+                _GIT,
+                "clone",
+                "-q",
+                "--filter=blob:none",
+                "--no-local",
+                source.resolve().as_uri(),
+                str(clone),
+            ],
+            check=True,
+            env=self._env(),
+            capture_output=True,
+        )
+        self.root = clone
+        # Without the promisor remote nothing can be lazily fetched: the blob is gone.
+        self._git("remote", "remove", "origin")
+        result = self._gate()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_grafts_and_replace_refs_cannot_cut_away_a_public_ancestor(self) -> None:
+        """Rewriting the parent graph locally must not turn the history into a safe root."""
+        for how in ("replace --graft", "info/grafts"):
+            with self.subTest(how=how):
+                self._fresh()
+                self._deleted_public_history()
+                if how == "replace --graft":
+                    self._git("replace", "--graft", "HEAD")
+                else:
+                    head = self._rev("HEAD")
+                    grafts = self.root / ".git" / "info" / "grafts"
+                    grafts.parent.mkdir(parents=True, exist_ok=True)
+                    grafts.write_text(head + "\n", encoding="ascii")
+                result = self._gate()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def _rev(self, rev: str) -> str:
+        """Resolve *rev* to a commit id in the fixture repo."""
+        return subprocess.run(
+            [_GIT, "rev-parse", rev],
+            cwd=self.root,
+            check=True,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def test_an_unresolvable_head_with_history_is_not_unborn(self) -> None:
+        """A broken HEAD or an orphan branch is not the first commit of a fresh repo."""
+        for how in ("broken symref", "orphan branch"):
+            with self.subTest(how=how):
+                self._fresh()
+                self._deleted_public_history()
+                if how == "broken symref":
+                    self._git("symbolic-ref", "HEAD", "refs/heads/does-not-exist")
+                else:
+                    self._git("checkout", "-q", "--orphan", "fresh-start")
+                self.assertEqual(self._gate().returncode, 1)
+                result = self._gate("--staged")
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_the_first_commit_of_a_fresh_repo_is_still_never_opted_in(self) -> None:
+        """Control: no commits at all, nothing staged as a declaration -> skip."""
+        (self.root / "README.md").write_text("first\n", encoding="utf-8")
+        self._git("add", "README.md")
+        result = self._gate("--staged")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 # The subclass exists for its own tests; do not run the inherited ones twice.
 for _name in [n for n in vars(VisibilityContract) if n.startswith("test_")]:
