@@ -500,6 +500,19 @@ class DeclarationSourceContract(VisibilityContract):
         result = self._gate()
         self.assertEqual(result.returncode, 1, result.stderr)
 
+    def test_a_symlink_declaration_in_history_is_not_a_private_opt_out(self) -> None:
+        """A symlink whose target string reads as private TOML is not a declaration."""
+        self._run(self._declare("public"))
+        decl = self.root / "publication.toml"
+        decl.unlink()
+        decl.symlink_to(self._declare("private-until-review"))
+        self._git("add", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "symlink declaration")
+        self._git("rm", "-q", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
+        result = self._gate()
+        self.assertEqual(result.returncode, 1, result.stderr)
+
     def test_removing_a_private_declaration_is_a_clean_opt_out(self) -> None:
         """Leaving the publication system is allowed once the declaration said private."""
         for history in (["private-until-review"], ["public", "private-until-review"]):

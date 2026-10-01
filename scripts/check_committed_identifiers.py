@@ -419,8 +419,18 @@ def _staged_declaration_text() -> str | None:
             f"{_DECLARATION_FILENAME} is staged but is not a regular file; the gate "
             "cannot tell whether this repo is public, so it will not pass."
         )
+    # Bytes, decoded as UTF-8 here: _run_git decodes with the LOCALE codec, which
+    # on Windows (cp1252) accepts any byte and would hide a non-UTF-8 blob.
+    blob_argv = ["git", "cat-file", "blob", meta[1]]
     try:
-        return _run_git(["git", "cat-file", "blob", meta[1]])
+        blob = subprocess.run(blob_argv, capture_output=True, check=True).stdout
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise GateError(
+            f"could not read the staged {_DECLARATION_FILENAME} ({exc}); the gate "
+            "cannot tell whether this repo is public, so it will not pass."
+        ) from exc
+    try:
+        return blob.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise GateError(
             f"the staged {_DECLARATION_FILENAME} is not valid UTF-8 ({exc}); the gate "
@@ -487,28 +497,32 @@ def _absent_declaration_verdict() -> bool:
             order.append(commit)
     head = order[0]
     # Bare "git", as _run_git passes it: the argv is a variable, as there.
-    check_argv = ["git", "cat-file", "--batch-check"]
+    # %(objectmode) (git >= 2.45): a symlink or gitlink at publication.toml is
+    # reported as a blob too, and its target string could read as a private
+    # declaration. Only a regular file is a declaration, as on every other path.
+    check_argv = ["git", "cat-file", "--batch-check=%(objectmode) %(objecttype) %(objectname)"]
     batch_argv = ["git", "cat-file", "--batch"]
     try:
-        checked = subprocess.run(
+        check_proc = subprocess.run(
             check_argv,
             input="".join(f"{c}:{_DECLARATION_FILENAME}\n" for c in order).encode(),
             capture_output=True,
             check=True,
-        ).stdout.decode("utf-8", "replace").splitlines()
+        )
     except (subprocess.CalledProcessError, OSError) as exc:
         raise GateError(f"could not read the declaration history ({exc})") from exc
+    checked = check_proc.stdout.decode("utf-8", "replace").splitlines()
     if len(checked) != len(order):
         raise GateError("could not read the declaration history (short batch-check output)")
     present: dict[str, str | None] = {}
     for commit, row in zip(order, checked, strict=True):
         fields = row.split()
-        if row.endswith(" missing") or len(fields) != 3:
+        if row.endswith(" missing"):
             present[commit] = None
-        elif fields[1] != "blob":
-            present[commit] = ""  # present but not a file: never a clean private
+        elif len(fields) != 3 or fields[0] not in ("100644", "100755") or fields[1] != "blob":
+            present[commit] = ""  # present but not a regular file: never a clean private
         else:
-            present[commit] = fields[0]
+            present[commit] = fields[2]
     blobs = sorted({oid for oid in present.values() if oid})
     private_blob: dict[str, bool] = {}
     if blobs:
@@ -533,9 +547,9 @@ def _absent_declaration_verdict() -> bool:
                 private_blob[oid] = False
     safe: dict[str, bool] = {}
     for commit in reversed(order):  # --topo-order lists children first
-        oid = present[commit]
-        if oid is not None:
-            safe[commit] = bool(oid) and private_blob.get(oid, False)
+        entry = present[commit]
+        if entry is not None:
+            safe[commit] = bool(entry) and private_blob.get(entry, False)
         else:
             safe[commit] = all(safe.get(p, True) for p in graph[commit])
     if safe[head]:
@@ -575,6 +589,7 @@ def _declares_public() -> bool:
             f"publication declaration and will not pass: {exc}"
         ) from exc
 
+    text: str | None
     if _DECLARATION_FROM_INDEX[0]:
         text = _staged_declaration_text()
         if text is None:
