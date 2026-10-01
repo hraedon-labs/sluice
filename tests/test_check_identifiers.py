@@ -196,17 +196,23 @@ def test_main_exits_zero_when_no_violation(
 def test_staged_mode_scans_staged_diff(
     monkeypatch: pytest.MonkeyPatch, checker: ModuleType, tmp_path: Path
 ) -> None:
-    """--staged routes through `git diff --cached` and still flags violations."""
+    """--staged selects its paths through `git diff --cached`.
+
+    Every subprocess is stubbed here, so the staged CONTENT is never materialised
+    and the gate fails closed on the unreadable snapshot. That the staged bytes
+    (not the worktree copy) are what gets scanned is pinned against real git in
+    test_identifier_gate_visibility.py.
+    """
     file_path = tmp_path / "staged.txt"
     file_path.write_text("Secret FAKEDOM value\n", encoding="utf-8")
     monkeypatch.setenv("FORBIDDEN_IDENTIFIERS", "FAKEDOM")
 
-    seen: dict[str, list[str]] = {}
+    seen: list[list[str]] = []
 
     def fake_run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
-        seen["args"] = args
+        seen.append(args)
         return CompletedProcess(args=args, returncode=0, stdout=f"{file_path}\0")
 
     monkeypatch.setattr(checker.subprocess, "run", fake_run)
     assert checker.main(["--staged"]) == 1
-    assert seen["args"][:3] == ["git", "diff", "--cached"]
+    assert any(call[:3] == ["git", "diff", "--cached"] for call in seen)

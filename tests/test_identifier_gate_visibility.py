@@ -221,10 +221,10 @@ class VisibilityContract(unittest.TestCase):
 
 
 class DeclarationSourceContract(VisibilityContract):
-    """Where the verdict is read from: the index in --staged, and only a real file.
+    """Where the verdict and the scanned bytes come from: the index in --staged.
 
-    Kept in a subclass so the fixtures are shared; the parent's tests are not
-    re-run here (see ``__test__`` handling below).
+    Subclasses VisibilityContract only to share its fixtures; the inherited tests
+    are blanked out after the class body so they do not run twice.
     """
 
     # -- --staged judges the index, not the worktree --------------------------
@@ -268,6 +268,117 @@ class DeclarationSourceContract(VisibilityContract):
                 (self.root / "publication.toml").symlink_to(target.name)
                 result = self._gate()
                 self.assertEqual(result.returncode, 1, result.stderr)
+
+    def _stage_raw_declaration(self, mode: str, stage_lines: list[str]) -> None:
+        """Write index entries for publication.toml directly (mode/oid/stage)."""
+        info = "".join(f"{mode} {line}\tpublication.toml\n" for line in stage_lines)
+        subprocess.run(
+            [_GIT, "update-index", "--index-info"],
+            cwd=self.root,
+            input=info.encode(),
+            check=True,
+            env=_clean_env(),
+            capture_output=True,
+        )
+
+    def _blob(self, data: bytes) -> str:
+        """Write *data* as a blob and return its object id."""
+        return (
+            subprocess.run(
+                [_GIT, "hash-object", "-w", "--stdin"],
+                cwd=self.root,
+                input=data,
+                check=True,
+                env=_clean_env(),
+                capture_output=True,
+            )
+            .stdout.decode()
+            .strip()
+        )
+
+    def test_staged_unreadable_declaration_entries_fail_closed(self) -> None:
+        """A conflicted, gitlink, symlink or non-UTF-8 staged declaration is not absence."""
+        public = b'[publication]\nvisibility = "public"\n'
+        private_bad_utf8 = b'[publication]\nvisibility = "private-until-review"\n# \xff\n'
+        for label in ("conflicted", "gitlink", "symlink", "non-utf-8"):
+            with self.subTest(case=label):
+                self._fresh()
+                self._run(None)
+                if label == "conflicted":
+                    oid = self._blob(public)
+                    self._stage_raw_declaration("100644", [f"{oid} 1", f"{oid} 2", f"{oid} 3"])
+                elif label == "gitlink":
+                    head = (
+                        subprocess.run(
+                            [_GIT, "rev-parse", "HEAD"],
+                            cwd=self.root,
+                            check=True,
+                            env=_clean_env(),
+                            capture_output=True,
+                        )
+                        .stdout.decode()
+                        .strip()
+                    )
+                    self._stage_raw_declaration("160000", [f"{head} 0"])
+                elif label == "symlink":
+                    self._stage_raw_declaration("120000", [f"{self._blob(b'elsewhere.toml')} 0"])
+                else:
+                    self._stage_raw_declaration("100644", [f"{self._blob(private_bad_utf8)} 0"])
+                result = self._gate("--staged")
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    # -- --staged scans the staged bytes, not the worktree copy ----------------
+
+    def test_staged_token_hidden_by_a_clean_worktree_copy_is_caught(self) -> None:
+        """Stage a forbidden token, then overwrite the file: the commit still records it."""
+        self._run(self._declare("private-until-review"))
+        notes = self.root / "notes.txt"
+        notes.write_text("mentions zzzsynthetictoken here\n", encoding="utf-8")
+        self._git("add", "notes.txt")
+        notes.write_text("clean in the worktree now\n", encoding="utf-8")
+        result = self._gate("--staged", denylist="zzzsynthetictoken")
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_unstaged_token_in_the_worktree_does_not_block_a_clean_commit(self) -> None:
+        """The inverse: unstaged junk in the worktree is not what the commit records."""
+        self._run(self._declare("private-until-review"))
+        notes = self.root / "notes.txt"
+        notes.write_text("clean\n", encoding="utf-8")
+        self._git("add", "notes.txt")
+        notes.write_text("mentions zzzsynthetictoken here\n", encoding="utf-8")
+        result = self._gate("--staged", denylist="zzzsynthetictoken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # -- removing a public declaration is not "never opted in" ----------------
+
+    def test_removing_a_public_declaration_does_not_disarm_the_gate(self) -> None:
+        """Deleting publication.toml does not make the remote private."""
+        for how in ("staged removal", "committed removal"):
+            with self.subTest(how=how):
+                self._fresh()
+                self._run(self._declare("public"))
+                self._git("rm", "-q", "--cached", "publication.toml")
+                if how == "committed removal":
+                    (self.root / "publication.toml").unlink()
+                    self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
+                    self._git("commit", "-q", "--no-verify", "--allow-empty", "-m", "later")
+                    result = self._gate()
+                else:
+                    result = self._gate("--staged")
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_removing_a_private_declaration_is_a_clean_opt_out(self) -> None:
+        """Leaving the publication system is allowed once the declaration said private."""
+        for history in (["private-until-review"], ["public", "private-until-review"]):
+            with self.subTest(history=history):
+                self._fresh()
+                for visibility in history:
+                    self._run(self._declare(visibility))
+                self._git("rm", "-q", "publication.toml")
+                self.assertEqual(self._gate("--staged").returncode, 0)
+                self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
+                result = self._gate()
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     # -- an unusable git is an error, not a verdict ----------------------------
 
