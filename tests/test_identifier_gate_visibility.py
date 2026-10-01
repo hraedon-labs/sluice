@@ -349,6 +349,19 @@ class DeclarationSourceContract(VisibilityContract):
         result = self._gate("--staged", denylist="zzzsynthetictoken")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_staged_scan_reads_raw_blobs_not_smudged_copies(self) -> None:
+        """A smudge filter must not be able to strip a token from what is scanned."""
+        self._run(self._declare("private-until-review"))
+        (self.root / ".gitattributes").write_text("*.txt filter=strip\n", encoding="utf-8")
+        self._git("config", "filter.strip.smudge", "sed s/zzzsynthetictoken/redacted/")
+        self._git("config", "filter.strip.clean", "cat")
+        notes = self.root / "notes.txt"
+        notes.write_text("mentions zzzsynthetictoken here\n", encoding="utf-8")
+        self._git("add", ".gitattributes", "notes.txt")
+        notes.write_text("clean in the worktree now\n", encoding="utf-8")
+        result = self._gate("--staged", denylist="zzzsynthetictoken")
+        self.assertEqual(result.returncode, 1, result.stderr)
+
     # -- removing a public declaration is not "never opted in" ----------------
 
     def test_removing_a_public_declaration_does_not_disarm_the_gate(self) -> None:
@@ -365,6 +378,50 @@ class DeclarationSourceContract(VisibilityContract):
                     result = self._gate()
                 else:
                     result = self._gate("--staged")
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_a_merge_that_deletes_a_public_declaration_does_not_disarm_the_gate(self) -> None:
+        """Both parents still have the file; the conflict is resolved by deleting it."""
+        self._run(self._declare("public"))
+        self._git("checkout", "-q", "-b", "side")
+        self._run(self._declare("Public"))
+        self._git("checkout", "-q", "-")
+        self._run(self._declare("PUBLIC"))
+        merge = subprocess.run(
+            [
+                _GIT,
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "user.name=Test",
+                "merge",
+                "--no-edit",
+                "side",
+            ],
+            cwd=self.root,
+            env=_clean_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertIn("CONFLICT", merge.stdout + merge.stderr)  # fixture really is a merge
+        self._git("rm", "-q", "-f", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "resolve by deleting")
+        self._git("commit", "-q", "--no-verify", "--allow-empty", "-m", "later")
+        result = self._gate()
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_laundering_a_public_declaration_through_garbage_does_not_disarm(self) -> None:
+        """Public, then invalid, then deleted: only a clean private declaration opts out."""
+        for garbage in ('[publication]\nvisibility = "publik"\n', "[publication\n", "[x]\n"):
+            with self.subTest(garbage=garbage):
+                self._fresh()
+                self._run(self._declare("public"))
+                self._run(garbage)
+                self._git("rm", "-q", "publication.toml")
+                self.assertEqual(self._gate("--staged").returncode, 1)
+                self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
+                result = self._gate()
                 self.assertEqual(result.returncode, 1, result.stderr)
 
     def test_removing_a_private_declaration_is_a_clean_opt_out(self) -> None:
