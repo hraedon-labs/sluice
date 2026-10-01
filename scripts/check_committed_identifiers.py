@@ -382,6 +382,48 @@ def leaked_tracked_files(paths: list[Path], guarded: frozenset[str]) -> list[Pat
     return [p for p in paths if p.parts and p.parts[0] in guarded]
 
 
+# Set by main() from --staged. In staged mode the publication verdict must come
+# from the INDEX -- the bytes the commit records -- not the worktree: otherwise a
+# commit that stages visibility="public" while the worktree still says
+# "private-until-review" (the publication flip, exactly where this matters) is
+# judged private and skipped. A one-element list so main() can set it without a
+# global statement.
+_DECLARATION_FROM_INDEX: list[bool] = [False]
+
+
+def _staged_declaration_text() -> str | None:
+    """The stage-0 index content of the declaration, or None if it is not staged.
+
+    Absence from the index is the only None. A conflicted entry, a non-regular
+    entry (symlink, submodule) or an undecodable blob is a GateError: those are
+    present-but-unreadable, not "never opted in".
+    """
+    listing = _run_git(
+        ["git", "ls-files", "--stage", "-z", "--", f":(top,literal){_DECLARATION_FILENAME}"]
+    )
+    entries = [e for e in listing.split("\0") if e]
+    if not entries:
+        return None
+    if len(entries) != 1:
+        raise GateError(
+            f"{_DECLARATION_FILENAME} has a conflicted index entry; the gate cannot "
+            "tell whether this repo is public, so it will not pass."
+        )
+    meta = entries[0].split("\t", 1)[0].split()
+    if len(meta) != 3 or meta[2] != "0" or meta[0] not in ("100644", "100755"):
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is staged but is not a regular file; the gate "
+            "cannot tell whether this repo is public, so it will not pass."
+        )
+    try:
+        return _run_git(["git", "cat-file", "blob", meta[1]])
+    except UnicodeDecodeError as exc:
+        raise GateError(
+            f"the staged {_DECLARATION_FILENAME} is not valid UTF-8 ({exc}); the gate "
+            "cannot tell whether this repo is public, so it will not pass."
+        ) from exc
+
+
 def _declares_public() -> bool:
     """True when this repo's publication.toml declares public visibility.
 
@@ -398,17 +440,43 @@ def _declares_public() -> bool:
     """
     try:
         repo_root = Path(_run_git(["git", "rev-parse", "--show-toplevel"]).strip())
-    except GateError:
-        # Not a git repo (or git is unusable). The caller's other git work will
-        # surface that; do not convert it into a publication verdict here.
-        return False
+    except GateError as exc:
+        # Fail closed. This used to return False ("not public"), which turned a
+        # broken or missing git into a skip in --message-file / --rev-range mode:
+        # those modes return straight after the verdict, so nothing later
+        # surfaced the error and a public repo exited 0 having scanned nothing.
+        raise GateError(
+            "could not resolve the repository root, so the gate cannot read the "
+            f"publication declaration and will not pass: {exc}"
+        ) from exc
 
-    path = repo_root / _DECLARATION_FILENAME
-    if not path.is_file():
-        return False
+    if _DECLARATION_FROM_INDEX[0]:
+        text = _staged_declaration_text()
+        if text is None:
+            return False
+    else:
+        path = repo_root / _DECLARATION_FILENAME
+        # Only genuine absence is the "never opted in" skip. A path that exists
+        # but is not a regular file (a directory, or a symlink -- dangling or
+        # not) used to take the same branch via `not path.is_file()`, so a
+        # stray directory or link silently disarmed a public repo's gate.
+        if not os.path.lexists(path):
+            return False
+        if path.is_symlink() or not path.is_file():
+            raise GateError(
+                f"{_DECLARATION_FILENAME} is present but is not a regular file; the "
+                "gate cannot tell whether this repo is public, so it will not pass."
+            )
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise GateError(
+                f"{_DECLARATION_FILENAME} is present but could not be read ({exc}); "
+                "the gate cannot tell whether this repo is public, so it will not pass."
+            ) from exc
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
         raise GateError(
             f"{_DECLARATION_FILENAME} is present but could not be parsed ({exc}); "
             "the gate cannot tell whether this repo is public, so it will not pass."
@@ -619,6 +687,7 @@ def main(argv: list[str] | None = None) -> int:
         "hook), e.g. origin/main..HEAD.",
     )
     args = parser.parse_args(argv)
+    _DECLARATION_FROM_INDEX[0] = bool(args.staged)
 
     try:
         return _run(args)

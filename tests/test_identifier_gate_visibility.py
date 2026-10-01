@@ -130,11 +130,19 @@ class VisibilityContract(unittest.TestCase):
             (self.root / "publication.toml").write_text(declaration, encoding="utf-8")
         self._git("add", "-A")
         self._git("commit", "-q", "--no-verify", "--allow-empty", "-m", "fixture")
+        return self._gate(denylist=denylist)
+
+    def _gate(
+        self, *args: str, denylist: str | None = None, path_env: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the gate in the fixture repo as-is (no add/commit) with *args*."""
         env = _clean_env()
         if denylist is not None:
             env[DENYLIST_VAR] = denylist
+        if path_env is not None:
+            env["PATH"] = path_env
         return subprocess.run(
-            [sys.executable, str(GATE)],
+            [sys.executable, str(GATE), *args],
             cwd=self.root,
             env=env,
             capture_output=True,
@@ -210,6 +218,73 @@ class VisibilityContract(unittest.TestCase):
         (self.root / "notes.txt").write_text("mentions zzzsynthetictoken here\n", encoding="utf-8")
         result = self._run(self._declare("Public"), denylist="zzzsynthetictoken")
         self.assertEqual(result.returncode, 1, result.stderr)
+
+
+class DeclarationSourceContract(VisibilityContract):
+    """Where the verdict is read from: the index in --staged, and only a real file.
+
+    Kept in a subclass so the fixtures are shared; the parent's tests are not
+    re-run here (see ``__test__`` handling below).
+    """
+
+    # -- --staged judges the index, not the worktree --------------------------
+
+    def test_staged_public_index_with_private_worktree_fails_closed(self) -> None:
+        """The publication-flip commit: public staged, worktree still private."""
+        self._run(self._declare("private-until-review"))
+        (self.root / "publication.toml").write_text(self._declare("public"), encoding="utf-8")
+        self._git("add", "publication.toml")
+        (self.root / "publication.toml").write_text(
+            self._declare("private-until-review"), encoding="utf-8"
+        )
+        result = self._gate("--staged")
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_staged_private_index_with_public_worktree_skips(self) -> None:
+        """The inverse divergence proves the index, not the worktree, decides."""
+        self._run(self._declare("private-until-review"))
+        (self.root / "publication.toml").write_text(self._declare("public"), encoding="utf-8")
+        result = self._gate("--staged")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # -- only genuine absence is "never opted in" ------------------------------
+
+    def test_directory_declaration_fails_rather_than_reading_as_absent(self) -> None:
+        """A directory named publication.toml is present, not absent."""
+        self._run(None)
+        (self.root / "publication.toml").mkdir()
+        result = self._gate()
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_symlinked_declaration_fails_rather_than_being_followed(self) -> None:
+        """A symlink (here to a private declaration, or dangling) is not a declaration."""
+        for target_exists in (True, False):
+            with self.subTest(target_exists=target_exists):
+                self._fresh()
+                self._run(None)
+                target = self.root / "elsewhere.toml"
+                if target_exists:
+                    target.write_text(self._declare("private-until-review"), encoding="utf-8")
+                (self.root / "publication.toml").symlink_to(target.name)
+                result = self._gate()
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    # -- an unusable git is an error, not a verdict ----------------------------
+
+    def test_unusable_git_fails_closed_in_message_mode(self) -> None:
+        """Message mode returns straight after the verdict, so a broken git must fail."""
+        self._run(self._declare("public"))
+        message = self.root / "msg.txt"
+        message.write_text("an ordinary message\n", encoding="utf-8")
+        empty_bin = Path(self._tmp.name) / "empty-bin"
+        empty_bin.mkdir(exist_ok=True)
+        result = self._gate("--message-file", str(message), path_env=str(empty_bin))
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+
+# The subclass exists for its own tests; do not run the inherited ones twice.
+for _name in [n for n in vars(VisibilityContract) if n.startswith("test_")]:
+    setattr(DeclarationSourceContract, _name, None)
 
 
 if __name__ == "__main__":
