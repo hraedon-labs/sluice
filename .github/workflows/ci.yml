@@ -27,6 +27,11 @@ jobs:
         env:
           FORBIDDEN_IDENTIFIERS: ${{ secrets.FORBIDDEN_IDENTIFIERS }}
         run: python scripts/check_committed_identifiers.py
+      - name: Published-range identifier gate
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        env:
+          FORBIDDEN_IDENTIFIERS: ${{ secrets.FORBIDDEN_IDENTIFIERS }}
+        run: python3 scripts/check_committed_identifiers.py --ci-range
 
   test:
     runs-on: ubuntu-latest

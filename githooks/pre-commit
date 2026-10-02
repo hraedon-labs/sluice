@@ -7,7 +7,7 @@
 # time it flags a token it is already in history; this hook closes that window.
 #
 # Companion hooks (all installed together): `commit-msg` scans the commit message,
-# `pre-push` checks publication plumbing and messages in the push range.
+# `pre-push` checks publication plumbing and everything in the push range.
 #
 # Activate (once per clone):   scripts/install-git-hooks.sh
 #
@@ -26,8 +26,6 @@
 # The shared canonical denylist holds work-domain identifiers only; homelab/lab
 # identifiers are deliberately NOT in it — lab topology is allowed in public
 # repos (docs/publication-review.md). Multi-word entries must be double-quoted.
-# Fail-open if no denylist is found so a fresh clone is not bricked; CI remains
-# the hard gate.
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
@@ -35,7 +33,7 @@ repo_root="$(git rev-parse --show-toplevel)"
 if [ -z "${FORBIDDEN_IDENTIFIERS:-}" ]; then
   for candidate in \
     "$repo_root/.identifiers-denylist.local" \
-    "$HOME/.config/agent-suite/forbidden-identifiers"; do
+    "${HOME:-}/.config/agent-suite/forbidden-identifiers"; do
     if [ -f "$candidate" ]; then
       FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
       export FORBIDDEN_IDENTIFIERS
@@ -44,14 +42,30 @@ if [ -z "${FORBIDDEN_IDENTIFIERS:-}" ]; then
   done
 fi
 
-if [ -z "${FORBIDDEN_IDENTIFIERS:-}" ]; then
-  echo "sluice pre-commit: identifier gate INACTIVE — no denylist found." >&2
-  echo "  Set \$FORBIDDEN_IDENTIFIERS, or create .identifiers-denylist.local (gitignored)" >&2
-  echo "  or ~/.config/agent-suite/forbidden-identifiers to enable it. Allowing commit." >&2
-  exit 0
+# No denylist: the gate decides from publication.toml. A repo declared PUBLIC is
+# refused (exit 1); a private-until-review repo stays a no-op so a fresh clone is
+# not bricked. The ONLY bypass is the explicit GATE_ALLOW_NO_DENYLIST=1, which
+# prints a warning every time it is used.
+no_denylist=0
+denylist="${FORBIDDEN_IDENTIFIERS:-}"
+if [ -z "${denylist//[[:space:]]/}" ]; then
+  no_denylist=1
+  if [ "${GATE_ALLOW_NO_DENYLIST:-}" = "1" ]; then
+    echo "sluice pre-commit: WARNING: identifier gate BYPASSED (GATE_ALLOW_NO_DENYLIST=1) -- no denylist, the staged content was NOT scanned." >&2
+    exit 0
+  fi
 fi
 
 python_bin="$repo_root/.venv/bin/python"
-[ -x "$python_bin" ] || python_bin="$(command -v python3 || command -v python)"
+[ -x "$python_bin" ] || python_bin="$(command -v python3 || command -v python || true)"
+if [ -z "$python_bin" ]; then
+  echo "sluice pre-commit: FATAL: no Python interpreter found; the identifier gate cannot run." >&2
+  exit 1
+fi
 
-exec "$python_bin" "$repo_root/scripts/check_committed_identifiers.py" --staged
+status=0
+"$python_bin" "$repo_root/scripts/check_committed_identifiers.py" --staged || status=$?
+if [ "$status" -ne 0 ] && [ "$no_denylist" -eq 1 ]; then
+  echo "sluice pre-commit: fix: put the denylist in ~/.config/agent-suite/forbidden-identifiers (or export FORBIDDEN_IDENTIFIERS); to bypass once, GATE_ALLOW_NO_DENYLIST=1 (warned)." >&2
+fi
+exit "$status"
