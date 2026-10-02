@@ -22,6 +22,7 @@ dependencies installed.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -29,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 
@@ -61,10 +63,7 @@ if len(_ENV_NAMES) != 1:
 DENYLIST_VAR = _ENV_NAMES[0]
 
 
-_EMPTY_HOME = tempfile.mkdtemp(prefix="gate-visibility-home-")
-
-
-def _clean_env() -> dict[str, str]:
+def _clean_env(home: Path) -> dict[str, str]:
     """The caller's environment minus every denylist-shaped variable.
 
     Inheriting a developer's or CI job's real denylist would arm the gate and
@@ -77,19 +76,51 @@ def _clean_env() -> dict[str, str]:
     # Some gates fall back to a denylist FILE under $HOME when the variable is
     # unset (a developer convenience). A developer box that has one would arm
     # the gate exactly as an inherited variable would, so HOME points at an
-    # empty directory for the duration of the run.
-    env["HOME"] = _EMPTY_HOME
+    # empty directory for the duration of the run. It lives inside the test's
+    # own temporary directory so it is removed with it (a module-level mkdtemp
+    # here used to leave one gate-visibility-home-* directory behind per run).
+    env["HOME"] = str(home)
     return env
+
+
+# Run the gate as Windows does: a locale codec (cp1252) that accepts almost any
+# byte, so text decoded with the locale default can never raise. On Linux the
+# locale is UTF-8 and a missing explicit UTF-8 decode is invisible; this makes it
+# visible. Patches the two hooks Python consults when no encoding is given:
+# locale.getencoding (subprocess text mode) and io.text_encoding (pathlib and
+# io.open). A bare builtin open() still uses the C-level locale; CI's Windows
+# legs cover that.
+_FORCED_LOCALE_WRAPPER = """
+import io, locale, os, runpy, sys
+_codec = sys.argv[1]
+locale.getencoding = lambda: _codec
+locale.getpreferredencoding = lambda do_setlocale=True: _codec
+def _text_encoding(encoding, stacklevel=2):
+    return _codec if encoding in (None, "locale") else encoding
+io.text_encoding = _text_encoding
+sys.argv = sys.argv[2:]
+# As `python script.py` would: the script's directory, not the cwd, is sys.path[0]
+# (the gate imports check_publication_plumbing from beside itself).
+sys.path[0] = os.path.dirname(os.path.abspath(sys.argv[0]))
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
 
 
 class VisibilityContract(unittest.TestCase):
     """The gate's exit code for each shape of the publication declaration."""
 
     def setUp(self) -> None:
-        """Create the scratch directory and the first fixture repo."""
-        self._tmp = tempfile.TemporaryDirectory()
+        """Create the scratch directory (cleaned up even if setUp fails) and a repo."""
+        self._tmp = tempfile.TemporaryDirectory(prefix="gate-visibility-")
+        self.addCleanup(self._tmp.cleanup)
+        self._home = Path(self._tmp.name) / "empty-home"
+        self._home.mkdir()
         self._count = 0
         self._fresh()
+
+    def _env(self) -> dict[str, str]:
+        """The isolated environment for this test (see _clean_env)."""
+        return _clean_env(self._home)
 
     def _fresh(self) -> None:
         """Point self.root at a new, empty git repo (one per subTest case)."""
@@ -98,10 +129,6 @@ class VisibilityContract(unittest.TestCase):
         self.root.mkdir()
         self._git("init", "-q")
         (self.root / "README.md").write_text("nothing forbidden here\n", encoding="utf-8")
-
-    def tearDown(self) -> None:
-        """Remove every fixture repo this test created."""
-        self._tmp.cleanup()
 
     def _git(self, *args: str) -> None:
         """Run git in the fixture repo with an isolated, deterministic config."""
@@ -118,7 +145,7 @@ class VisibilityContract(unittest.TestCase):
             ],
             cwd=self.root,
             check=True,
-            env=_clean_env(),
+            env=self._env(),
             capture_output=True,
         )
 
@@ -136,7 +163,7 @@ class VisibilityContract(unittest.TestCase):
         self, *args: str, denylist: str | None = None, path_env: str | None = None
     ) -> subprocess.CompletedProcess[str]:
         """Run the gate in the fixture repo as-is (no add/commit) with *args*."""
-        env = _clean_env()
+        env = self._env()
         if denylist is not None:
             env[DENYLIST_VAR] = denylist
         if path_env is not None:
@@ -147,6 +174,20 @@ class VisibilityContract(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
+            timeout=120,
+            check=False,
+        )
+
+    def _gate_forced_locale(self, codec: str, *args: str) -> subprocess.CompletedProcess[str]:
+        """Run the gate with *codec* forced as the locale default (no denylist)."""
+        return subprocess.run(
+            [sys.executable, "-X", "utf8=0", "-c", _FORCED_LOCALE_WRAPPER, codec, str(GATE), *args],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
             check=False,
         )
@@ -277,7 +318,7 @@ class DeclarationSourceContract(VisibilityContract):
             cwd=self.root,
             input=info.encode(),
             check=True,
-            env=_clean_env(),
+            env=self._env(),
             capture_output=True,
         )
 
@@ -289,7 +330,7 @@ class DeclarationSourceContract(VisibilityContract):
                 cwd=self.root,
                 input=data,
                 check=True,
-                env=_clean_env(),
+                env=self._env(),
                 capture_output=True,
             )
             .stdout.decode()
@@ -297,10 +338,23 @@ class DeclarationSourceContract(VisibilityContract):
         )
 
     def test_staged_unreadable_declaration_entries_fail_closed(self) -> None:
-        """A conflicted, gitlink, symlink or non-UTF-8 staged declaration is not absence."""
+        """A conflicted, gitlink, symlink or non-UTF-8 staged declaration is not absence.
+
+        The "symlink to private TOML" case stages a 120000 entry whose target
+        string is itself a valid private declaration: it can only fail on the
+        mode check, not incidentally on a parse error as the plain symlink does.
+        """
         public = b'[publication]\nvisibility = "public"\n'
+        private = b'[publication]\nvisibility = "private-until-review"\n'
         private_bad_utf8 = b'[publication]\nvisibility = "private-until-review"\n# \xff\n'
-        for label in ("conflicted", "gitlink", "symlink", "non-utf-8"):
+        for label in (
+            "conflicted",
+            "gitlink",
+            "symlink",
+            "symlink to private TOML",
+            "executable regular file (control)",
+            "non-utf-8",
+        ):
             with self.subTest(case=label):
                 self._fresh()
                 self._run(None)
@@ -313,7 +367,7 @@ class DeclarationSourceContract(VisibilityContract):
                             [_GIT, "rev-parse", "HEAD"],
                             cwd=self.root,
                             check=True,
-                            env=_clean_env(),
+                            env=self._env(),
                             capture_output=True,
                         )
                         .stdout.decode()
@@ -322,6 +376,15 @@ class DeclarationSourceContract(VisibilityContract):
                     self._stage_raw_declaration("160000", [f"{head} 0"])
                 elif label == "symlink":
                     self._stage_raw_declaration("120000", [f"{self._blob(b'elsewhere.toml')} 0"])
+                elif label == "symlink to private TOML":
+                    self._stage_raw_declaration("120000", [f"{self._blob(private)} 0"])
+                elif label == "executable regular file (control)":
+                    # Control: the same bytes as a regular 100755 file ARE a
+                    # declaration, so the case above fails on mode alone.
+                    self._stage_raw_declaration("100755", [f"{self._blob(private)} 0"])
+                    result = self._gate("--staged")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    continue
                 else:
                     self._stage_raw_declaration("100644", [f"{self._blob(private_bad_utf8)} 0"])
                 result = self._gate("--staged")
@@ -412,7 +475,7 @@ class DeclarationSourceContract(VisibilityContract):
                 "side",
             ],
             cwd=self.root,
-            env=_clean_env(),
+            env=self._env(),
             capture_output=True,
             text=True,
             check=False,
@@ -473,7 +536,7 @@ class DeclarationSourceContract(VisibilityContract):
                 "public-line",
             ],
             cwd=self.root,
-            env=_clean_env(),
+            env=self._env(),
             capture_output=True,
             text=True,
             check=False,
@@ -489,7 +552,7 @@ class DeclarationSourceContract(VisibilityContract):
                 subprocess.run(
                     [_GIT, "rev-list", "--parents", "-1", "HEAD"],
                     cwd=self.root,
-                    env=_clean_env(),
+                    env=self._env(),
                     capture_output=True,
                     text=True,
                     check=True,
@@ -537,6 +600,419 @@ class DeclarationSourceContract(VisibilityContract):
         empty_bin.mkdir(exist_ok=True)
         result = self._gate("--message-file", str(message), path_env=str(empty_bin))
         self.assertEqual(result.returncode, 1, result.stderr)
+
+    # -- the declaration is decoded as UTF-8 explicitly, never the locale ------
+
+    def test_forced_locale_wrapper_really_changes_the_default_codec(self) -> None:
+        """Self-check: under the wrapper, text-mode subprocess output decodes as cp1252."""
+        probe = Path(self._tmp.name) / "probe_codec.py"
+        probe.write_text(
+            "import subprocess, sys\n"
+            "out = subprocess.run([sys.executable, '-c', "
+            "'import sys; sys.stdout.buffer.write(bytes([0xff]))'], "
+            "capture_output=True, text=True).stdout\n"
+            "sys.exit(0 if out == '\\u00ff' else 3)\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8=0", "-c", _FORCED_LOCALE_WRAPPER, "cp1252", str(probe)],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_non_utf8_declaration_fails_closed_under_a_permissive_locale(self) -> None:
+        """Under cp1252 (Windows) a locale decode accepts the byte; UTF-8 must not.
+
+        Each body is a clean private declaration plus one 0xFF byte in a comment,
+        so a gate that decodes with the locale codec reads it as private and
+        skips (exit 0). Covered: the staged blob, the worktree file, and the last
+        declaration in history before a removal.
+        """
+        bad = b'[publication]\nvisibility = "private-until-review"\n# \xff\n'
+        for where in ("staged", "worktree", "history"):
+            with self.subTest(where=where):
+                self._fresh()
+                if where == "history":
+                    self._run(self._declare("public"))
+                (self.root / "publication.toml").write_bytes(bad)
+                self._git("add", "publication.toml")
+                if where == "staged":
+                    (self.root / "publication.toml").write_text(
+                        self._declare("private-until-review"), encoding="utf-8"
+                    )
+                    result = self._gate_forced_locale("cp1252", "--staged")
+                elif where == "worktree":
+                    self._git("commit", "-q", "--no-verify", "-m", "declaration")
+                    result = self._gate_forced_locale("cp1252")
+                else:
+                    self._git("commit", "-q", "--no-verify", "-m", "corrupt")
+                    self._git("rm", "-q", "publication.toml")
+                    self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
+                    result = self._gate_forced_locale("cp1252")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_clean_declarations_still_pass_under_a_permissive_locale(self) -> None:
+        """Control for the test above: the wrapper alone does not make the gate fail."""
+        for history in (["private-until-review"], ["public", "private-until-review"]):
+            with self.subTest(history=history):
+                self._fresh()
+                for visibility in history:
+                    self._run(self._declare(visibility))
+                self.assertEqual(self._gate_forced_locale("cp1252").returncode, 0)
+                self.assertEqual(self._gate_forced_locale("cp1252", "--staged").returncode, 0)
+
+    def test_absence_verdict_survives_the_strictest_locale(self) -> None:
+        """The absence path's git reads decode under ASCII, so no decode arm is needed.
+
+        Pins the argument that removed _git_or_none's UnicodeDecodeError arm: its
+        only caller reads `rev-parse --verify -q HEAD`, whose output is a hex id or
+        nothing. Under a strict ASCII locale, never-opted-in still skips, a deleted
+        public declaration still fails, and neither raises.
+        """
+        for history, expected in (([], 0), (["public"], 1), (["private-until-review"], 0)):
+            with self.subTest(history=history):
+                self._fresh()
+                self._run(None)
+                for visibility in history:
+                    self._run(self._declare(visibility))
+                if history:
+                    self._git("rm", "-q", "publication.toml")
+                    self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
+                result = self._gate_forced_locale("ascii")
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    # -- a shallow clone cannot judge absence ---------------------------------
+
+    def _shallow_clone(self, depth: int = 1) -> Path:
+        """Clone self.root with --depth *depth* and point self.root at the clone."""
+        source = self.root
+        clone = Path(self._tmp.name) / f"shallow{self._count}"
+        subprocess.run(
+            [_GIT, "clone", "-q", f"--depth={depth}", source.resolve().as_uri(), str(clone)],
+            check=True,
+            env=self._env(),
+            capture_output=True,
+        )
+        self.root = clone
+        is_shallow = subprocess.run(
+            [_GIT, "rev-parse", "--is-shallow-repository"],
+            cwd=clone,
+            check=True,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(is_shallow, "true")  # the fixture really is shallow
+        return clone
+
+    def test_shallow_clone_cannot_launder_a_deleted_public_declaration(self) -> None:
+        """actions/checkout is depth 1 by default: the deleting commit is all it sees.
+
+        The full clone fails closed; the shallow one used to see a root with no
+        declaration and skip (exit 0). It must refuse instead, in tree and staged
+        mode, whatever the clone depth.
+        """
+        for depth in (1, 2):
+            with self.subTest(depth=depth):
+                self._fresh()
+                self._run(self._declare("public"))
+                self._git("rm", "-q", "publication.toml")
+                self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
+                self._git("commit", "-q", "--no-verify", "--allow-empty", "-m", "later")
+                self.assertEqual(self._gate().returncode, 1)  # full history: closed
+                self._shallow_clone(depth)
+                result = self._gate()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("shallow", result.stderr)
+                self.assertEqual(self._gate("--staged").returncode, 1)
+
+    def test_shallow_clone_with_a_declaration_is_not_blocked(self) -> None:
+        """Only the absence verdict reads history: a declared shallow clone is judged as usual."""
+        for visibility, expected in (("private-until-review", 0), ("public", 1)):
+            with self.subTest(visibility=visibility):
+                self._fresh()
+                self._run(self._declare("public"))
+                self._run(self._declare(visibility))
+                self._shallow_clone()
+                result = self._gate()
+                self.assertEqual(result.returncode, expected, result.stderr)
+                if visibility == "public":
+                    self.assertNotIn("shallow", result.stderr)
+
+    # -- a history the gate cannot see whole is refused ------------------------
+
+    def _deleted_public_history(self) -> None:
+        """Commit a public declaration, delete it, then commit again (no denylist)."""
+        self._run(self._declare("public"))
+        self._git("rm", "-q", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "remove declaration")
+        self._git("commit", "-q", "--no-verify", "--allow-empty", "-m", "later")
+
+    def test_partial_clone_cannot_launder_a_deleted_public_declaration(self) -> None:
+        """A --filter=blob:none clone lacks the declaration blob: "missing" is not absence."""
+        self._deleted_public_history()
+        self._git("config", "uploadpack.allowFilter", "true")
+        source = self.root
+        clone = Path(self._tmp.name) / f"partial{self._count}"
+        subprocess.run(
+            [
+                _GIT,
+                "clone",
+                "-q",
+                "--filter=blob:none",
+                "--no-local",
+                source.resolve().as_uri(),
+                str(clone),
+            ],
+            check=True,
+            env=self._env(),
+            capture_output=True,
+        )
+        self.root = clone
+        # Without the promisor remote nothing can be lazily fetched: the blob is gone.
+        self._git("remote", "remove", "origin")
+        result = self._gate()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_grafts_and_replace_refs_cannot_cut_away_a_public_ancestor(self) -> None:
+        """Rewriting the parent graph locally must not turn the history into a safe root."""
+        for how in ("replace --graft", "info/grafts"):
+            with self.subTest(how=how):
+                self._fresh()
+                self._deleted_public_history()
+                if how == "replace --graft":
+                    self._git("replace", "--graft", "HEAD")
+                else:
+                    head = self._rev("HEAD")
+                    grafts = self.root / ".git" / "info" / "grafts"
+                    grafts.parent.mkdir(parents=True, exist_ok=True)
+                    grafts.write_text(head + "\n", encoding="ascii")
+                result = self._gate()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def _rev(self, rev: str) -> str:
+        """Resolve *rev* to a commit id in the fixture repo."""
+        return subprocess.run(
+            [_GIT, "rev-parse", rev],
+            cwd=self.root,
+            check=True,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def test_an_unresolvable_head_with_history_is_not_unborn(self) -> None:
+        """A broken HEAD or an orphan branch is not the first commit of a fresh repo."""
+        for how in ("broken symref", "orphan branch"):
+            with self.subTest(how=how):
+                self._fresh()
+                self._deleted_public_history()
+                if how == "broken symref":
+                    self._git("symbolic-ref", "HEAD", "refs/heads/does-not-exist")
+                else:
+                    self._git("checkout", "-q", "--orphan", "fresh-start")
+                self.assertEqual(self._gate().returncode, 1)
+                result = self._gate("--staged")
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_the_first_commit_of_a_fresh_repo_is_still_never_opted_in(self) -> None:
+        """Control: no commits at all, nothing staged as a declaration -> skip."""
+        (self.root / "README.md").write_text("first\n", encoding="utf-8")
+        self._git("add", "README.md")
+        result = self._gate("--staged")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _forge_commit_graph_roots(self) -> None:
+        """Write a commit-graph, blank every commit's parents, and re-seal its checksum."""
+        self._git("commit-graph", "write", "--reachable")
+        path = self.root / ".git" / "objects" / "info" / "commit-graph"
+        data = bytearray(path.read_bytes())
+        hash_len = 20 if data[5] == 1 else 32
+        chunks: dict[bytes, int] = {}
+        for i in range(data[6] + 1):
+            entry = 8 + 12 * i
+            chunks[bytes(data[entry : entry + 4])] = int.from_bytes(data[entry + 4 : entry + 12])
+        count = int.from_bytes(data[chunks[b"OIDF"] + 255 * 4 : chunks[b"OIDF"] + 256 * 4])
+        for n in range(count):
+            row = chunks[b"CDAT"] + n * (hash_len + 16) + hash_len
+            data[row : row + 8] = (0x70000000).to_bytes(4) * 2  # GRAPH_PARENT_NONE x2
+        body = bytes(data[:-hash_len])
+        # Git's own object-format checksum, not a security use.
+        if hash_len == 20:
+            digest = hashlib.sha1(body, usedforsecurity=False)
+        else:
+            digest = hashlib.sha256(body)
+        path.chmod(0o644)
+        path.write_bytes(body + digest.digest())
+
+    def test_a_forged_commit_graph_cannot_cut_away_a_public_ancestor(self) -> None:
+        """A checksum-valid commit-graph whose parent slots were blanked is not history."""
+        self._deleted_public_history()
+        self._forge_commit_graph_roots()
+        count = subprocess.run(
+            [_GIT, "rev-list", "--count", "HEAD"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(count, "1")  # the fixture really does fool plain git
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_an_object_whose_bytes_do_not_match_its_id_is_not_trusted(self) -> None:
+        """A loose public-declaration blob rewritten to say private is corruption, not history."""
+        self._deleted_public_history()
+        oid = self._rev("HEAD~2:publication.toml")
+        loose = self.root / ".git" / "objects" / oid[:2] / oid[2:]
+        body = self._declare("private-until-review").encode()
+        loose.chmod(0o644)
+        loose.write_bytes(zlib.compress(b"blob %d\0" % len(body) + body))
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_dangling_history_under_a_broken_head_is_not_unborn(self) -> None:
+        """HEAD unresolvable and every ref deleted: the commits are still there."""
+        self._deleted_public_history()
+        branch = subprocess.run(
+            [_GIT, "symbolic-ref", "HEAD"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self._git("symbolic-ref", "HEAD", "refs/heads/unborn")
+        self._git("update-ref", "-d", branch)
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_an_orphan_branch_with_its_own_commit_is_still_the_public_repo(self) -> None:
+        """A fresh root cut from a public repo is judged with the repo's other refs."""
+        self._deleted_public_history()
+        self._git("checkout", "-q", "--orphan", "fresh-start")
+        self._git("commit", "-q", "--no-verify", "-m", "fresh root, no declaration")
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_an_orphan_branch_in_a_private_repo_is_still_fine(self) -> None:
+        """Control: when every ref's last declaration is cleanly private, absence skips."""
+        self._run(self._declare("private-until-review"))
+        self._git("rm", "-q", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "opt out")
+        self._git("checkout", "-q", "--orphan", "fresh-start")
+        self._git("commit", "-q", "--no-verify", "--allow-empty", "-m", "fresh root")
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _break_head_and_drop_refs(self) -> None:
+        """Point HEAD at a missing branch and delete every ref (history left dangling)."""
+        refs = subprocess.run(
+            [_GIT, "for-each-ref", "--format=%(refname)"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        self._git("symbolic-ref", "HEAD", "refs/heads/unborn")
+        for ref in refs:
+            self._git("update-ref", "-d", ref)
+
+    def test_a_damaged_object_store_is_not_an_unborn_repo(self) -> None:
+        """Commits disguised as blobs, a pack without its index, or a foreign object dir."""
+        for how in ("commits rewritten as blobs", "pack index removed", "GIT_OBJECT_DIRECTORY"):
+            with self.subTest(how=how):
+                self._fresh()
+                self._deleted_public_history()
+                objects = self.root / ".git" / "objects"
+                commits = subprocess.run(
+                    [_GIT, "rev-list", "--all"],
+                    cwd=self.root,
+                    env=self._env(),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.split()
+                if how == "pack index removed":
+                    self._git("repack", "-adq")
+                    self._git("prune-packed")
+                self._break_head_and_drop_refs()
+                env_extra: dict[str, str] = {}
+                if how == "commits rewritten as blobs":
+                    for oid in commits:
+                        loose = objects / oid[:2] / oid[2:]
+                        loose.chmod(0o644)
+                        loose.write_bytes(zlib.compress(b"blob 1\0x"))
+                elif how == "pack index removed":
+                    for idx in (objects / "pack").glob("*.idx"):
+                        idx.chmod(0o644)
+                        idx.unlink()
+                else:
+                    empty = Path(self._tmp.name) / f"empty-objects{self._count}"
+                    empty.mkdir()
+                    env_extra["GIT_OBJECT_DIRECTORY"] = str(empty)
+                for args in ((), ("--staged",)):
+                    env = self._env()
+                    env.update(env_extra)
+                    result = subprocess.run(
+                        [sys.executable, str(GATE), *args],
+                        cwd=self.root,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_old_public_refs_and_stashes_do_not_block_a_clean_opt_out(self) -> None:
+        """public, then cleanly private, then removed: a public-era tag or stash is superseded."""
+        for keep in ("tag at the public commit", "stash made while public"):
+            with self.subTest(keep=keep):
+                self._fresh()
+                self._run(self._declare("public"))
+                if keep == "tag at the public commit":
+                    self._git("tag", "v-public")
+                else:
+                    (self.root / "README.md").write_text("work in progress\n", encoding="utf-8")
+                    self._git("stash", "push", "-q")
+                self._run(self._declare("private-until-review"))
+                self._git("rm", "-q", "publication.toml")
+                self._git("commit", "-q", "--no-verify", "-m", "opt out")
+                for args in ((), ("--staged",)):
+                    result = self._gate(*args)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_public_side_branch_still_counts(self) -> None:
+        """A ref that is NOT an ancestor of the opt-out (here a public side branch) is a tip."""
+        self._run(self._declare("public"))
+        self._git("branch", "still-public")
+        self._run(self._declare("private-until-review"))
+        self._git("checkout", "-q", "still-public")
+        (self.root / "side.txt").write_text("side\n", encoding="utf-8")
+        self._run(None)
+        self._git("checkout", "-q", "-")
+        self._git("rm", "-q", "publication.toml")
+        self._git("commit", "-q", "--no-verify", "-m", "opt out")
+        for args in ((), ("--staged",)):
+            result = self._gate(*args)
+            self.assertEqual(result.returncode, 1, result.stderr)
 
 
 # The subclass exists for its own tests; do not run the inherited ones twice.
