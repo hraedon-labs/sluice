@@ -23,6 +23,7 @@ dependencies installed.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -191,6 +192,28 @@ class VisibilityContract(unittest.TestCase):
             timeout=120,
             check=False,
         )
+
+    def _shallow_clone(self, depth: int = 1) -> Path:
+        """Clone self.root with --depth *depth* and point self.root at the clone."""
+        source = self.root
+        clone = Path(self._tmp.name) / f"shallow{self._count}"
+        subprocess.run(
+            [_GIT, "clone", "-q", f"--depth={depth}", source.resolve().as_uri(), str(clone)],
+            check=True,
+            env=self._env(),
+            capture_output=True,
+        )
+        self.root = clone
+        is_shallow = subprocess.run(
+            [_GIT, "rev-parse", "--is-shallow-repository"],
+            cwd=clone,
+            check=True,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(is_shallow, "true")  # the fixture really is shallow
+        return clone
 
     @staticmethod
     def _declare(visibility: str) -> str:
@@ -690,28 +713,6 @@ class DeclarationSourceContract(VisibilityContract):
 
     # -- a shallow clone cannot judge absence ---------------------------------
 
-    def _shallow_clone(self, depth: int = 1) -> Path:
-        """Clone self.root with --depth *depth* and point self.root at the clone."""
-        source = self.root
-        clone = Path(self._tmp.name) / f"shallow{self._count}"
-        subprocess.run(
-            [_GIT, "clone", "-q", f"--depth={depth}", source.resolve().as_uri(), str(clone)],
-            check=True,
-            env=self._env(),
-            capture_output=True,
-        )
-        self.root = clone
-        is_shallow = subprocess.run(
-            [_GIT, "rev-parse", "--is-shallow-repository"],
-            cwd=clone,
-            check=True,
-            env=self._env(),
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        self.assertEqual(is_shallow, "true")  # the fixture really is shallow
-        return clone
-
     def test_shallow_clone_cannot_launder_a_deleted_public_declaration(self) -> None:
         """actions/checkout is depth 1 by default: the deleting commit is all it sees.
 
@@ -1015,9 +1016,616 @@ class DeclarationSourceContract(VisibilityContract):
             self.assertEqual(result.returncode, 1, result.stderr)
 
 
-# The subclass exists for its own tests; do not run the inherited ones twice.
-for _name in [n for n in vars(VisibilityContract) if n.startswith("test_")]:
-    setattr(DeclarationSourceContract, _name, None)
+class PublishedRangeContract(VisibilityContract):
+    """--rev-range / --ci-range scan everything a push publishes, not just messages.
+
+    Subclasses VisibilityContract only to share its fixtures; the inherited tests
+    are blanked out after the class body so they do not run twice.
+    """
+
+    TOKEN = "zzzsynthetictoken"
+
+    def _commit(self, message: str = "commit", **identity: str) -> str:
+        """Commit everything (as *identity*, via GIT_AUTHOR_*/GIT_COMMITTER_*), return HEAD."""
+        env = self._env()
+        env.update(identity)
+        self._git("add", "-A")
+        subprocess.run(
+            [
+                _GIT,
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                message,
+            ],
+            cwd=self.root,
+            check=True,
+            env=env,
+            capture_output=True,
+        )
+        return self._head()
+
+    def _head(self) -> str:
+        """The current HEAD commit id."""
+        return subprocess.run(
+            [_GIT, "rev-parse", "HEAD"],
+            cwd=self.root,
+            check=True,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def _base(self) -> str:
+        """A committed private-until-review repo with one clean file; returns its HEAD."""
+        (self.root / "publication.toml").write_text(
+            self._declare("private-until-review"), encoding="utf-8"
+        )
+        return self._commit("base")
+
+    def _range(self, rev_range: str, denylist: str | None = None) -> int:
+        """Exit code of --rev-range *rev_range* with the synthetic token denylisted."""
+        result = self._gate("--rev-range", rev_range, denylist=denylist or self.TOKEN)
+        self.assertNotIn("Traceback", result.stderr)
+        return result.returncode
+
+    def test_clean_range_passes(self) -> None:
+        """Control: an ordinary range with no token anywhere is not blocked."""
+        base = self._base()
+        (self.root / "notes.txt").write_text("clean\n", encoding="utf-8")
+        self._commit("add notes")
+        self.assertEqual(self._range(f"{base}..HEAD"), 0)
+
+    def test_a_token_added_and_removed_inside_the_range_is_caught(self) -> None:
+        """The tip tree is clean, but the intermediate blob is published with history."""
+        base = self._base()
+        notes = self.root / "notes.txt"
+        notes.write_text(f"mentions {self.TOKEN}\n", encoding="utf-8")
+        self._commit("add")
+        notes.write_text("clean now\n", encoding="utf-8")
+        self._commit("scrub")
+        self.assertEqual(self._gate(denylist=self.TOKEN).returncode, 0)  # tip is clean
+        self.assertEqual(self._range(f"{base}..HEAD"), 1)
+
+    def test_tokens_in_identity_message_and_path_are_caught(self) -> None:
+        """Author/committer name and email, the message, and a file NAME all publish."""
+        cases = {
+            "author name": {"GIT_AUTHOR_NAME": f"{self.TOKEN} Person"},
+            "author email": {"GIT_AUTHOR_EMAIL": f"dev@{self.TOKEN}.example"},
+            "committer name": {"GIT_COMMITTER_NAME": f"{self.TOKEN}"},
+            "committer email": {"GIT_COMMITTER_EMAIL": f"ci@{self.TOKEN}.example"},
+            "message": {},
+            "path": {},
+        }
+        for label, identity in cases.items():
+            with self.subTest(case=label):
+                self._fresh()
+                base = self._base()
+                if label == "path":
+                    (self.root / f"{self.TOKEN}.txt").write_text("clean\n", encoding="utf-8")
+                message = f"mentions {self.TOKEN}" if label == "message" else "ordinary"
+                self._commit(message, **identity)
+                self.assertEqual(self._range(f"{base}..HEAD"), 1)
+
+    def test_an_evil_merge_resolution_is_caught(self) -> None:
+        """Content that exists only in a merge commit (in neither parent) is scanned."""
+        base = self._base()
+        self._git("checkout", "-q", "-b", "side")
+        (self.root / "side.txt").write_text("side\n", encoding="utf-8")
+        self._commit("side")
+        self._git("checkout", "-q", "-")
+        (self.root / "main.txt").write_text("main\n", encoding="utf-8")
+        self._commit("main")
+        self._git("merge", "-q", "--no-ff", "--no-commit", "side")
+        (self.root / "merge-only.txt").write_text(f"{self.TOKEN}\n", encoding="utf-8")
+        self._commit("merge")
+        self.assertEqual(self._range(f"{base}..HEAD"), 1)
+        # Control: both parents' own ranges are clean, so the merge alone carries it.
+        self.assertEqual(self._range(f"{base}..HEAD^1"), 0)
+        self.assertEqual(self._range(f"{base}..HEAD^2"), 0)
+
+    def test_commits_already_published_are_not_rescanned(self) -> None:
+        """Only the range is judged: a token in an EXCLUDED commit does not block."""
+        self._base()
+        self._commit("old", GIT_AUTHOR_NAME=self.TOKEN)
+        published = self._head()
+        (self.root / "notes.txt").write_text("clean\n", encoding="utf-8")
+        self._commit("new")
+        self.assertEqual(self._range(f"{published}..HEAD"), 0)
+
+    def test_new_branch_form_scans_everything_not_on_a_remote(self) -> None:
+        """The pre-push new-branch / force-push form: <sha> --not --remotes=<name>."""
+        self._base()
+        remote = Path(self._tmp.name) / f"remote{self._count}.git"
+        subprocess.run(
+            [_GIT, "init", "-q", "--bare", str(remote)],
+            check=True,
+            env=self._env(),
+            capture_output=True,
+        )
+        self._git("remote", "add", "origin", str(remote))
+        self._git("push", "-q", "origin", "HEAD:refs/heads/main")
+        self._git("fetch", "-q", "origin")
+        self._git("checkout", "-q", "-b", "feature")
+        (self.root / "notes.txt").write_text(f"{self.TOKEN}\n", encoding="utf-8")
+        self._commit("add")
+        (self.root / "notes.txt").write_text("clean\n", encoding="utf-8")
+        self._commit("scrub")
+        self.assertEqual(self._range("HEAD --not --remotes=origin"), 1)
+        self._git("push", "-q", "origin", "HEAD:refs/heads/feature")
+        self._git("fetch", "-q", "origin")
+        self.assertEqual(self._range("HEAD --not --remotes=origin"), 0)  # now published
+
+    def test_range_without_a_denylist_fails_closed_on_a_public_repo(self) -> None:
+        """The range scan honours the same unconfigured semantics as the tree scan."""
+        for visibility, expected in (("public", 1), ("private-until-review", 0)):
+            with self.subTest(visibility=visibility):
+                self._fresh()
+                self._run(self._declare(visibility))
+                self._commit("more")
+                result = self._gate("--rev-range", "HEAD~1..HEAD")
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_unresolvable_range_fails_closed(self) -> None:
+        """A range git cannot resolve is a refusal, never an empty pass."""
+        self._base()
+        self.assertEqual(self._range("no-such-ref..HEAD"), 1)
+
+    def test_a_token_inside_a_binary_blob_is_caught(self) -> None:
+        """The range publishes binary files too: an identifier in their bytes counts."""
+        base = self._base()
+        (self.root / "blob.bin").write_bytes(b"prefix\x00" + self.TOKEN.encode() + b"\x00suffix")
+        self._commit("add binary")
+        self.assertEqual(self._range(f"{base}..HEAD"), 1)
+
+    def test_encoded_tokens_inside_binary_blobs_are_caught(self) -> None:
+        """BOM-less UTF-16 (both byte orders) and non-ASCII UTF-8 next to NULs still count."""
+        token = "zzzsynthetictok\u00e9n"
+        bodies = {
+            "utf-16-le, no BOM": f"hello {token} world".encode("utf-16-le"),
+            "utf-16-be, no BOM": f"hello {token} world".encode("utf-16-be"),
+            "utf-16-le, odd offset": b"\x00" + f"hello {token}".encode("utf-16-le"),
+            "utf-8 between NULs": b"\x00" + token.encode("utf-8") + b"\x00",
+        }
+        for label, body in bodies.items():
+            with self.subTest(case=label):
+                self._fresh()
+                base = self._base()
+                (self.root / "blob.dat").write_bytes(body)
+                self._commit("add encoded blob")
+                self.assertEqual(self._range(f"{base}..HEAD", denylist=token), 1)
+
+    def test_utf32_blobs_and_legacy_encoded_path_names_are_caught(self) -> None:
+        """BOM-less UTF-32 content, and a path name spelled in ISO-8859-1 bytes."""
+        token = "zzzsynthetictok\u00e9n"
+        for label in ("utf-32-le", "utf-32-be", "iso-8859-1 path"):
+            with self.subTest(case=label):
+                self._fresh()
+                base = self._base()
+                if label == "iso-8859-1 path":
+                    name = os.fsdecode(token.encode("iso-8859-1") + b".txt")
+                    (self.root / name).write_text("clean\n", encoding="utf-8")
+                else:
+                    (self.root / "blob.dat").write_bytes(f"before {token} after".encode(label))
+                self._commit("add")
+                self.assertEqual(self._range(f"{base}..HEAD", denylist=token), 1)
+
+    def test_replace_refs_do_not_hide_what_a_push_publishes(self) -> None:
+        """A local refs/replace surrogate must not stand in for the commit being pushed."""
+        base = self._base()
+        (self.root / "dirty.txt").write_text(f"{self.TOKEN}\n", encoding="utf-8")
+        dirty = self._commit(f"dirty {self.TOKEN}")
+        self._git("reset", "-q", "--hard", base)
+        (self.root / "clean.txt").write_text("clean\n", encoding="utf-8")
+        surrogate = self._commit("clean surrogate")
+        self._git("replace", dirty, surrogate)
+        self.assertEqual(self._range(f"{base}..{dirty}"), 1)
+
+    def _head_tree(self) -> str:
+        """The tree id of HEAD."""
+        return subprocess.run(
+            [_GIT, "rev-parse", "HEAD^{tree}"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    def _raw_object(self, kind: str, body: bytes) -> str:
+        """Write a raw *kind* object (bytes exactly as given) and return its id."""
+        return (
+            subprocess.run(
+                [_GIT, "hash-object", "-t", kind, "-w", "--stdin"],
+                cwd=self.root,
+                input=body,
+                env=self._env(),
+                capture_output=True,
+                check=True,
+            )
+            .stdout.decode()
+            .strip()
+        )
+
+    def test_text_is_matched_under_every_plausible_decoding(self) -> None:
+        """No header but legacy bytes, or a header that lies about the identity: still caught."""
+        token = "zzzsynthetictok\u00e9n"
+        latin1, utf8 = token.encode("iso-8859-1"), token.encode("utf-8")
+        for label in ("commit message, no header", "tag message, no header", "utf-8 author"):
+            with self.subTest(case=label):
+                self._fresh()
+                base = self._base()
+                tree = self._head_tree()
+                who = b"Test <t@example.invalid> 1700000000 +0000"
+                if label == "tag message, no header":
+                    obj = self._raw_object(
+                        "tag",
+                        b"object "
+                        + base.encode()
+                        + b"\ntype commit\ntag v1\ntagger "
+                        + who
+                        + b"\n\nrelease "
+                        + latin1
+                        + b"\n",
+                    )
+                    rev = f"{obj} --not {base}"
+                else:
+                    author = b"Test " + utf8 if label == "utf-8 author" else b"Test"
+                    header = b"encoding ISO-8859-1\n" if label == "utf-8 author" else b""
+                    message = b"ordinary" if label == "utf-8 author" else b"mentions " + latin1
+                    obj = self._raw_object(
+                        "commit",
+                        b"tree "
+                        + tree.encode()
+                        + b"\nparent "
+                        + base.encode()
+                        + b"\nauthor "
+                        + author
+                        + b" <t@example.invalid> 1700000000 +0000"
+                        + b"\ncommitter "
+                        + who
+                        + b"\n"
+                        + header
+                        + b"\n"
+                        + message
+                        + b"\n",
+                    )
+                    rev = f"{base}..{obj}"
+                self.assertEqual(self._range(rev, denylist=token), 1)
+
+    def test_a_message_in_a_legacy_encoding_is_decoded_per_its_header(self) -> None:
+        """Git records i18n.commitEncoding in the commit; the scan must honour it."""
+        base = self._base()
+        token = "zzzsynthetictok\u00e9n"
+        message = Path(self._tmp.name) / f"msg{self._count}.txt"
+        message.write_bytes(f"mentions {token}\n".encode("iso-8859-1"))
+        self._git(
+            "-c",
+            "i18n.commitEncoding=ISO-8859-1",
+            "commit",
+            "-q",
+            "--no-verify",
+            "--allow-empty",
+            "-F",
+            str(message),
+        )
+        self.assertEqual(self._range(f"{base}..HEAD", denylist=token), 1)
+
+    def test_annotated_tag_name_tagger_and_message_are_caught(self) -> None:
+        """Pushing an annotated tag publishes its name, tagger and message."""
+        cases = {
+            "message": ("v1", {}, f"release {self.TOKEN}"),
+            "tagger": ("v1", {"GIT_COMMITTER_NAME": self.TOKEN}, "release"),
+            "name": (f"v1-{self.TOKEN}", {}, "release"),
+        }
+        for label, (name, identity, text) in cases.items():
+            with self.subTest(case=label):
+                self._fresh()
+                base = self._base()
+                env = self._env()
+                env.update(identity)
+                subprocess.run(
+                    [
+                        _GIT,
+                        "-c",
+                        "user.email=t@example.invalid",
+                        "-c",
+                        "user.name=Test",
+                        "tag",
+                        "-a",
+                        name,
+                        "-m",
+                        text,
+                    ],
+                    cwd=self.root,
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                )
+                tag = subprocess.run(
+                    [_GIT, "rev-parse", f"refs/tags/{name}"],
+                    cwd=self.root,
+                    env=self._env(),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+                # The pre-push new-ref form: nothing new but the tag object itself.
+                self.assertEqual(self._range(f"{tag} --not {base}"), 1)
+                zero = "0" * 40
+                ci = self._ci("push", {"before": zero, "after": tag, "ref": f"refs/tags/{name}"})
+                self.assertEqual(ci.returncode, 1, ci.stderr)
+        self._fresh()
+        base = self._base()
+        self._git("tag", "-a", "v-clean", "-m", "release")
+        self.assertEqual(self._range(f"v-clean --not {base}"), 0)  # control
+
+    # -- --ci-range derives the range from the GitHub event --------------------
+
+    def _ci(self, event_name: str, payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+        """Run --ci-range with a synthetic GitHub event."""
+        event = Path(self._tmp.name) / f"event{self._count}.json"
+        event.write_text(json.dumps(payload), encoding="utf-8")
+        env = self._env()
+        env[DENYLIST_VAR] = self.TOKEN
+        env["GITHUB_EVENT_NAME"] = event_name
+        env["GITHUB_EVENT_PATH"] = str(event)
+        return subprocess.run(
+            [sys.executable, str(GATE), "--ci-range"],
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    def test_ci_range_scans_push_and_pull_request_ranges(self) -> None:
+        """A push before..after, a new-branch push, and a PR base..head all scan the range."""
+        zero = "0" * 40
+        base = self._base()
+        (self.root / "notes.txt").write_text(f"{self.TOKEN}\n", encoding="utf-8")
+        self._commit("add")
+        (self.root / "notes.txt").write_text("clean\n", encoding="utf-8")
+        head = self._commit("scrub")
+        events: dict[str, tuple[str, dict[str, object]]] = {
+            "push": ("push", {"before": base, "after": head, "ref": "refs/heads/main"}),
+            "new branch": ("push", {"before": zero, "after": head, "ref": "refs/heads/x"}),
+            "pull_request": (
+                "pull_request",
+                {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}},
+            ),
+        }
+        for label, (name, payload) in events.items():
+            with self.subTest(event=label):
+                result = self._ci(name, payload)
+                self.assertEqual(result.returncode, 1, result.stderr)
+        clean = self._ci("push", {"before": head, "after": head, "ref": "refs/heads/main"})
+        self.assertEqual(clean.returncode, 0, clean.stderr)  # empty range: nothing new
+
+    def test_ci_range_refuses_what_it_cannot_derive(self) -> None:
+        """Unknown events, missing commits and a shallow checkout are refusals."""
+        base = self._base()
+        unknown = self._ci("schedule", {})
+        self.assertEqual(unknown.returncode, 1, unknown.stderr)
+        missing = self._ci("push", {"before": base, "after": "1" * 40, "ref": "refs/heads/m"})
+        self.assertEqual(missing.returncode, 1, missing.stderr)
+        deleted = self._ci("push", {"deleted": True, "ref": "refs/heads/m"})
+        self.assertEqual(deleted.returncode, 0, deleted.stderr)
+        self._commit("second")
+        self._shallow_clone()
+        shallow = self._ci("push", {"before": base, "after": self._head(), "ref": "refs/heads/m"})
+        self.assertEqual(shallow.returncode, 1, shallow.stderr)
+
+
+class TrackednessContract(VisibilityContract):
+    """What is scanned is decided by git tracked-ness, never by path.
+
+    Subclasses VisibilityContract only to share its fixtures; the inherited tests
+    are blanked out after the class body so they do not run twice.
+    """
+
+    def test_a_tracked_file_under_venv_is_refused_without_a_denylist(self) -> None:
+        """A force-added .venv/ file (root or nested) is refused in every mode."""
+        for where in (".venv/leak.txt", "pkg/.venv/lib/leak.txt"):
+            with self.subTest(path=where):
+                self._fresh()
+                self._run(self._declare("private-until-review"))
+                target = self.root / where
+                target.parent.mkdir(parents=True)
+                target.write_text("clean content\n", encoding="utf-8")
+                self._git("add", "-f", where)
+                self.assertEqual(self._gate("--staged").returncode, 1)
+                self._git("commit", "-q", "--no-verify", "-m", "force-add venv")
+                self.assertEqual(self._gate().returncode, 1)
+                self.assertEqual(self._gate("--rev-range", "HEAD~1..HEAD").returncode, 1)
+
+    def test_an_untracked_venv_is_not_read(self) -> None:
+        """Control: an ordinary, untracked .venv/ holding the token blocks nothing."""
+        self._run(self._declare("private-until-review"))
+        venv = self.root / ".venv"
+        venv.mkdir()
+        (venv / "leak.txt").write_text("zzzsynthetictoken\n", encoding="utf-8")
+        result = self._gate(denylist="zzzsynthetictoken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_file_merely_named_venv_is_scanned_not_refused(self) -> None:
+        """Only a .venv DIRECTORY is refused; a file named .venv is scanned as usual."""
+        self._run(self._declare("private-until-review"))
+        (self.root / ".venv").write_text("clean\n", encoding="utf-8")
+        self._git("add", "-f", ".venv")
+        self._git("commit", "-q", "--no-verify", "-m", "file named .venv")
+        self.assertEqual(self._gate(denylist="zzzsynthetictoken").returncode, 0)
+        (self.root / ".venv").write_text("zzzsynthetictoken\n", encoding="utf-8")
+        self._git("add", "-f", ".venv")
+        self._git("commit", "-q", "--no-verify", "-m", "token")
+        self.assertEqual(self._gate(denylist="zzzsynthetictoken").returncode, 1)
+
+
+class LocalHookContract(VisibilityContract):
+    """The commit-msg hook fails closed on a public repo with no denylist.
+
+    Runs the repo's own githooks/commit-msg against a fixture repo carrying a copy
+    of the gate. Subclasses VisibilityContract only to share its fixtures; the
+    inherited tests are blanked out after the class body so they do not run twice.
+    """
+
+    HOOK = GATE.parent.parent / "githooks" / "commit-msg"
+
+    def _hook(self, visibility: str, **extra: str) -> subprocess.CompletedProcess[str]:
+        """Run the commit-msg hook in a fixture declaring *visibility*, no denylist."""
+        self._run(self._declare(visibility))
+        scripts = self.root / "scripts"
+        scripts.mkdir(exist_ok=True)
+        for source in GATE.parent.glob("check_*.py"):
+            shutil.copy2(source, scripts / source.name)
+        message = self.root / "msg.txt"
+        message.write_text("an ordinary message\n", encoding="utf-8")
+        env = self._env()
+        env.update(extra)
+        bash = shutil.which("bash") or "bash"
+        return subprocess.run(
+            [bash, str(self.HOOK), str(message)],
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    def setUp(self) -> None:
+        """Skip where the repo carries no commit-msg hook or no bash."""
+        if os.name == "nt" or not self.HOOK.is_file() or shutil.which("bash") is None:
+            self.skipTest("POSIX hook test: no githooks/commit-msg, no bash, or Windows")
+        super().setUp()
+
+    def test_public_repo_without_a_denylist_is_refused_with_a_hint(self) -> None:
+        """Exit 1, and the output names the one opt-out."""
+        result = self._hook("public")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("GATE_ALLOW_NO_DENYLIST", result.stderr)
+
+    def test_explicit_opt_out_passes_loudly(self) -> None:
+        """GATE_ALLOW_NO_DENYLIST=1 is the only bypass, and it says so every time."""
+        result = self._hook("public", GATE_ALLOW_NO_DENYLIST="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BYPASS", result.stderr.upper())
+
+    def test_any_other_opt_out_value_does_not_bypass(self) -> None:
+        """Only the exact value 1 opts out: "true", "yes", "0" do not."""
+        for value in ("true", "yes", "0", " 1"):
+            with self.subTest(value=value):
+                self._fresh()
+                result = self._hook("public", GATE_ALLOW_NO_DENYLIST=value)
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    PRE_PUSH = GATE.parent.parent / "githooks" / "pre-push"
+
+    def test_a_deletion_only_push_still_refuses_a_public_repo_without_a_denylist(self) -> None:
+        """No range is scanned for a deletion, but the missing-denylist rule still holds."""
+        for visibility, expected in (("public", 1), ("private-until-review", 0)):
+            with self.subTest(visibility=visibility):
+                self._fresh()
+                self._hook(visibility)  # fixture: declaration, scripts/ copied
+                head = subprocess.run(
+                    [_GIT, "rev-parse", "HEAD"],
+                    cwd=self.root,
+                    env=self._env(),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+                bash = shutil.which("bash") or "bash"
+                result = subprocess.run(
+                    [bash, str(self.PRE_PUSH), "origin", "https://example.invalid/x.git"],
+                    cwd=self.root,
+                    env=self._env(),
+                    input=f"refs/heads/gone {'0' * 40} refs/heads/gone {head}\n",
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_a_deletion_only_push_refuses_an_unusable_denylist_too(self) -> None:
+        """A denylist of only too-short entries is no denylist on a public repo."""
+        self._hook("public")
+        head = subprocess.run(
+            [_GIT, "rev-parse", "HEAD"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        env = self._env()
+        env[DENYLIST_VAR] = "ab cd"
+        bash = shutil.which("bash") or "bash"
+        result = subprocess.run(
+            [bash, str(self.PRE_PUSH), "origin", "https://example.invalid/x.git"],
+            cwd=self.root,
+            env=env,
+            input=f"refs/heads/gone {'0' * 40} refs/heads/gone {head}\n",
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_the_opt_out_warns_even_when_the_denylist_is_merely_unusable(self) -> None:
+        """GATE_ALLOW_NO_DENYLIST=1 with only too-short entries: passes, and says so."""
+        self._hook("public")
+        head = subprocess.run(
+            [_GIT, "rev-parse", "HEAD"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        env = self._env()
+        env[DENYLIST_VAR] = "ab"
+        env["GATE_ALLOW_NO_DENYLIST"] = "1"
+        bash = shutil.which("bash") or "bash"
+        result = subprocess.run(
+            [bash, str(self.PRE_PUSH), "origin", "https://example.invalid/x.git"],
+            cwd=self.root,
+            env=env,
+            input=f"refs/heads/gone {'0' * 40} refs/heads/gone {head}\n",
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BYPASS", result.stderr.upper())
+
+    def test_private_repo_without_a_denylist_is_unchanged(self) -> None:
+        """private-until-review keeps its no-op: a fresh clone is not bricked."""
+        result = self._hook("private-until-review")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+# The subclasses exist for their own tests; do not run the inherited ones again.
+for _cls in (
+    DeclarationSourceContract,
+    PublishedRangeContract,
+    TrackednessContract,
+    LocalHookContract,
+):
+    for _name in [n for n in vars(VisibilityContract) if n.startswith("test_")]:
+        setattr(_cls, _name, None)
 
 
 if __name__ == "__main__":

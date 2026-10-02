@@ -37,6 +37,8 @@ Run locally: python scripts/check_committed_identifiers.py
 from __future__ import annotations
 
 import argparse
+import codecs
+import json
 import os
 import re
 import shlex
@@ -56,11 +58,10 @@ MIN_IDENTIFIER_LENGTH = 4
 # matches all of those forms; see _phrase_pattern.
 _PHRASE_SEPARATOR = r"[\s._\-]+"
 _BINARY_SNIFF_LEN = 8192
-# Dirs skipped by the identifier scan: .venv is build output. The always-on
-# guard below handles root-level samples/ (which holds real identifier-bearing
-# data); nested directories named samples/ (e.g. tests/samples/) are legitimate
-# code dirs and SHOULD be scanned.
-_SKIP_DIRS = frozenset({".venv"})
+# Nothing is skipped by PATH. What is scanned is decided by git tracked-ness:
+# every tracked (or staged, or pushed) file is scanned. A tracked file under any
+# .venv/ is refused outright by the always-on guard below.
+_VENV_DIR = ".venv"
 # Root-level gitignored data dirs that must never contain a tracked file. The
 # guard matches the first path component so a legitimate nested code dir named
 # ``samples`` (e.g. ``tests/samples/``) is not a false positive.
@@ -299,12 +300,25 @@ def _run_git(args: list[str]) -> str:
     return result.stdout
 
 
+def _run_git_bytes(args: list[str]) -> bytes:
+    """Run a git command and return raw stdout (for NUL-delimited records)."""
+    try:
+        return subprocess.run(args, capture_output=True, check=True).stdout
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
+        raise GateError(
+            f"git command failed ({' '.join(args)}): exit {exc.returncode}: {stderr.strip()}"
+        ) from exc
+    except OSError as exc:
+        raise GateError(f"could not run git ({' '.join(args)}): {exc}") from exc
+
+
 def _paths_from_git(args: list[str]) -> list[Path]:
     """Run a NUL-delimited git path command and return Paths.
 
-    No filtering is applied here — the always-on samples/ guard needs to see
-    every tracked path so it can detect a force-add. The identifier scan
-    filters out _SKIP_DIRS separately.
+    No filtering is applied here or later: the always-on guards need to see every
+    tracked path so they can detect a force-add, and the identifier scan reads
+    every tracked path (no path-based skip).
     """
     paths: list[Path] = []
     for raw in _run_git(args).split("\0"):
@@ -317,31 +331,6 @@ def _paths_from_git(args: list[str]) -> list[Path]:
 def collect_tracked_paths() -> list[Path]:
     """Return tracked file paths from ``git ls-files``, excluding obvious skips."""
     return _paths_from_git(["git", "ls-files", "-z"])
-
-
-def collect_range_messages(rev_range: str) -> list[tuple[str, str]]:
-    """Return ``(sha, message)`` for every commit in *rev_range*.
-
-    Commit messages are a publication channel the content gate never covered:
-    the tracked-tree scan reads files, so an identifier named only in a message
-    is invisible to it. That blind spot is not hypothetical — a public repo
-    carried work-domain identifiers in three commit messages, two of which were
-    the very commits that redacted those identifiers from the files. The message
-    described what the diff removed.
-    """
-    # rev_range may carry several git-log arguments (the pre-push new-branch case
-    # passes "<sha> --not --remotes=<name>"), so it is split rather than passed
-    # as one opaque argument.
-    result = _run_git(
-        ["git", "log", "--format=%H%x1f%B%x1e", *rev_range.split()],
-    )
-    messages: list[tuple[str, str]] = []
-    for record in result.split("\x1e"):
-        if "\x1f" not in record:
-            continue
-        sha, body = record.split("\x1f", 1)
-        messages.append((sha.strip(), body))
-    return messages
 
 
 def collect_staged_paths() -> list[Path]:
@@ -378,12 +367,13 @@ def print_report(violations: list[Violation]) -> None:
 
 
 def leaked_tracked_files(paths: list[Path], guarded: frozenset[str]) -> list[Path]:
-    """Tracked files whose root component is a guarded (gitignored) data dir.
+    """Tracked paths refused by the always-on guard.
 
-    Matches only the first path component so a nested code directory that happens
-    to be named ``samples`` (e.g. ``tests/samples/``) is not a false positive.
+    Guarded data dirs match only the first component, so a nested code directory
+    named ``samples`` is legitimate. Anything under a ``.venv/`` directory at
+    any depth is refused; a file merely named ``.venv`` is scanned normally.
     """
-    return [p for p in paths if p.parts and p.parts[0] in guarded]
+    return [p for p in paths if (p.parts and p.parts[0] in guarded) or _VENV_DIR in p.parts[:-1]]
 
 
 # Set by main() from --staged. In staged mode the publication verdict must come
@@ -839,18 +829,345 @@ def _scan_message_file(path: Path) -> int:
     return 0
 
 
+_OBJECT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_NULL_OBJECT_ID = re.compile(r"0+")
+_GITLINK_MODE = "160000"
+
+
+@dataclass(frozen=True)
+class RangeCommit:
+    """One commit about to be published, read from its raw object."""
+
+    sha: str
+    identities: tuple[str, ...]
+    message: str
+
+
+def collect_range_commits(rev_range: str) -> list[str]:
+    """Return every commit id in *rev_range* (oldest first).
+
+    The range may contain several rev-list arguments, so it is split rather than
+    passed as one opaque argument. Unexpected output is a refusal.
+    """
+    out = _run_git(["git", "rev-list", "--reverse", *rev_range.split()])
+    commits = [line.strip() for line in out.splitlines() if line.strip()]
+    for sha in commits:
+        if not _OBJECT_ID.fullmatch(sha):
+            raise GateError(f"git rev-list returned a line that is not an object id: {sha!r}")
+    return commits
+
+
+def _read_objects(oids: list[str]) -> dict[str, bytes]:
+    """Read raw Git objects in one batch, refusing missing or short output."""
+    if not oids:
+        return {}
+    batch_argv = ["git", "cat-file", "--batch"]
+    try:
+        out = subprocess.run(
+            batch_argv,
+            input="".join(f"{oid}\n" for oid in oids).encode(),
+            capture_output=True,
+            check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise GateError(f"could not read objects in the push range ({exc})") from exc
+    objects: dict[str, bytes] = {}
+    pos = 0
+    for oid in oids:
+        header_end = out.find(b"\n", pos)
+        if header_end == -1:
+            raise GateError("could not read objects in the push range (short output)")
+        header = out[pos:header_end].split()
+        if len(header) != 3 or header[0].decode("ascii", "replace") != oid:
+            raise GateError(f"object {oid[:9]} in the push range is missing or unreadable")
+        size = int(header[2])
+        objects[oid] = out[header_end + 1 : header_end + 1 + size]
+        pos = header_end + 1 + size + 1
+    return objects
+
+
+def _parse_commit(sha: str, raw: bytes) -> RangeCommit:
+    """Split a raw commit object into identities and its message."""
+    headers, separator, message = raw.partition(b"\n\n")
+    if not separator:
+        raise GateError(f"commit {sha[:9]} has no header/message separator")
+    encoding = _object_encoding(headers)
+    identities: list[str] = []
+    for line in headers.split(b"\n"):
+        key, _, value = line.partition(b" ")
+        if key in (b"author", b"committer"):
+            identity = value.rsplit(b" ", 2)[0] if value.count(b" ") >= 2 else value
+            identities.append(_text_views(identity, encoding))
+    return RangeCommit(
+        sha=sha,
+        identities=tuple(identities),
+        message=_text_views(message, encoding),
+    )
+
+
+def _text_views(data: bytes, declared: str) -> str:
+    """*data* decoded every plausible way, one view per line; a hit in ANY view counts.
+
+    Git does not guarantee that a commit's or tag's bytes match its ``encoding``
+    header: a legacy-encoded message can carry no header at all (read as UTF-8),
+    and author/committer names are often UTF-8 inside an ISO-8859-1 commit.
+    Picking the "right" codec is guesswork, so the scan does not pick: the
+    declared encoding, UTF-8 and latin-1 (the raw bytes, one char each) are all
+    scanned.
+    """
+    views: list[str] = []
+    for codec in dict.fromkeys((declared, "utf-8", "latin-1")):
+        view = data.decode(codec, errors="replace")
+        if view not in views:
+            views.append(view)
+    return "\n".join(views)
+
+
+def _object_encoding(headers: bytes) -> str:
+    """Return a commit or tag's declared codec, defaulting safely to UTF-8."""
+    for line in headers.split(b"\n"):
+        if line.startswith(b"encoding "):
+            name = line[len(b"encoding ") :].decode("ascii", errors="replace").strip()
+            try:
+                return codecs.lookup(name).name
+            except LookupError:
+                return "utf-8"
+    return "utf-8"
+
+
+def _range_tag_objects(rev_range: str) -> list[str]:
+    """Return annotated tag objects named on the positive side of a range."""
+    positive: list[str] = []
+    negated = False
+    for rev_arg in rev_range.split():
+        if rev_arg == "--not":
+            negated = not negated
+        elif rev_arg.startswith(("-", "^")):
+            continue
+        elif ".." in rev_arg:
+            positive.append(rev_arg.rsplit("..", 1)[1].lstrip(".") or "HEAD")
+        elif not negated:
+            positive.append(rev_arg)
+    tags: list[str] = []
+    for rev in positive:
+        oid = _run_git(["git", "rev-parse", "--verify", "--end-of-options", rev]).strip()
+        while oid not in tags and _run_git(["git", "cat-file", "-t", oid]).strip() == "tag":
+            tags.append(oid)
+            first = _read_objects([oid])[oid].split(b"\n", 1)[0].split()
+            if len(first) != 2 or first[0] != b"object":
+                raise GateError(f"tag {oid[:9]} has no object header")
+            oid = first[1].decode("ascii", errors="replace")
+    return tags
+
+
+def _introduced_entries(sha: str) -> list[tuple[str, str, Path, bytes]]:
+    """Return mode, blob id and path for every path introduced by *sha*.
+
+    Every parent is diffed so merge-only resolutions are visible; roots are
+    diffed against the empty tree. Renames are decomposed and deletions skipped.
+    """
+    out = _run_git_bytes(
+        ["git", "diff-tree", "-r", "-z", "-m", "--root", "--no-renames", "--no-commit-id", sha]
+    )
+    fields = out.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) % 2:
+        raise GateError(f"git diff-tree returned a malformed record for {sha[:9]}")
+    entries: list[tuple[str, str, Path, bytes]] = []
+    for meta, raw_path in zip(fields[0::2], fields[1::2], strict=True):
+        parts = meta.decode("ascii", errors="replace").lstrip(":").split()
+        if len(parts) != 5:
+            raise GateError(f"git diff-tree returned a malformed record for {sha[:9]}")
+        _src_mode, dst_mode, _src, dst, status = parts
+        if status.startswith("D") or _NULL_OBJECT_ID.fullmatch(dst):
+            continue
+        path = Path(raw_path.decode("utf-8", errors="replace"))
+        entries.append((dst_mode, dst, path, raw_path))
+    return entries
+
+
+def _byte_views(data: bytes) -> str:
+    """Decode bytes in every supported single- and multibyte text representation."""
+    views = [data.decode("latin-1"), data.decode("utf-8", errors="replace")]
+    for codec, width in (
+        ("utf-16-le", 2),
+        ("utf-16-be", 2),
+        ("utf-32-le", 4),
+        ("utf-32-be", 4),
+    ):
+        for offset in range(width):
+            views.append(data[offset:].decode(codec, errors="replace"))
+    return "\n".join(views)
+
+
+def _scan_blob_bytes(blob: bytes, identifiers: frozenset[str], path: Path) -> list[Violation]:
+    """Scan one published blob, including binary content."""
+    chunk = blob[:_BINARY_SNIFF_LEN]
+    if _is_binary(chunk):
+        # Read the bytes every way an identifier could be encoded in them: one
+        # byte per char (ASCII in any binary), UTF-8 (non-ASCII), and UTF-16 in
+        # both byte orders at both alignments (a BOM-less UTF-16 file has NULs,
+        # so it lands here). Each view is scanned; any hit counts.
+        text = _byte_views(blob)
+    else:
+        text = blob.decode(_sniff_encoding(chunk) or "utf-8", errors="replace")
+        text = text.removeprefix("\ufeff")
+    return [replace(v, path=path) for v in scan_text(text, identifiers)]
+
+
 def _scan_rev_range(rev_range: str) -> int:
-    """pre-push mode: scan every commit message about to be published."""
+    """Scan everything a range publishes, including intermediate versions."""
+    commits = collect_range_commits(rev_range)
+    tags = _range_tag_objects(rev_range)
+    introduced: dict[str, list[tuple[str, str, Path, bytes]]] = {
+        sha: _introduced_entries(sha) for sha in commits
+    }
+    for sha, entries in introduced.items():
+        leaked = leaked_tracked_files(
+            [path for _mode, _oid, path, _raw in entries], _GUARDED_DIRS
+        )
+        if leaked:
+            print(f"Commit {sha[:9]} adds paths that must never be committed:", file=sys.stderr)
+            for path in sorted(leaked, key=str):
+                print(f"  {path}", file=sys.stderr)
+            print(
+                "\nRewrite the range so no commit carries them (they are published "
+                "with the history even if a later commit removes them).",
+                file=sys.stderr,
+            )
+            return 1
+
     identifiers = _resolve_identifiers()
     if identifiers is None:
         return 0
+    parsed = _read_objects(commits)
+    blob_ids = sorted(
+        {
+            oid
+            for entries in introduced.values()
+            for mode, oid, _path, _raw in entries
+            if mode != _GITLINK_MODE
+        }
+    )
+    blobs = _read_objects(blob_ids)
     failed = False
-    for sha, body in collect_range_messages(rev_range):
-        violations = list(scan_text(body, identifiers))
+    for oid, raw in _read_objects(tags).items():
+        headers, _separator, message = raw.partition(b"\n\n")
+        encoding = _object_encoding(headers)
+        fields = [_text_views(message, encoding)]
+        for line in headers.split(b"\n"):
+            key, _, value = line.partition(b" ")
+            if key == b"tag":
+                fields.append(_text_views(value, encoding))
+            elif key == b"tagger":
+                tagger_identity = value.rsplit(b" ", 2)[0] if value.count(b" ") >= 2 else value
+                fields.append(_text_views(tagger_identity, encoding))
+        tag_hits = sorted({v.identifier for field in fields for v in scan_text(field, identifiers)})
+        if tag_hits:
+            print(
+                f"Forbidden identifier in annotated tag {oid[:9]} (name, tagger or "
+                f"message): {tag_hits!r}",
+                file=sys.stderr,
+            )
+            failed = True
+    scanned_blobs: set[str] = set()
+    for sha in commits:
+        commit = _parse_commit(sha, parsed[sha])
+        violations = list(scan_text(commit.message, identifiers))
         if violations:
             _report_message_violations(f"commit message {sha[:9]}", violations)
             failed = True
+        for identity in commit.identities:
+            hits = list(scan_text(identity, identifiers))
+            if hits:
+                print(
+                    f"Forbidden identifier in the author/committer identity of commit "
+                    f"{sha[:9]}: {sorted({v.identifier for v in hits})!r}",
+                    file=sys.stderr,
+                )
+                failed = True
+        content: list[Violation] = []
+        for mode, oid, path, raw_path in introduced[sha]:
+            path_text = path.as_posix() + "\n" + _byte_views(raw_path)
+            content.extend(replace(v, path=path) for v in scan_text(path_text, identifiers))
+            if mode == _GITLINK_MODE or oid in scanned_blobs:
+                continue
+            scanned_blobs.add(oid)
+            content.extend(_scan_blob_bytes(blobs[oid], identifiers, path))
+        if content:
+            print(f"In commit {sha[:9]}:", file=sys.stderr)
+            print_report(content)
+            failed = True
+    if failed:
+        print(
+            "\nEverything in the range is published with the push: messages, author and "
+            "committer identities, and every intermediate file version. Rewrite the "
+            "offending commits (rebase/amend; reset the author with --reset-author) "
+            "before pushing.",
+            file=sys.stderr,
+        )
     return 1 if failed else 0
+
+
+def _ci_rev_range() -> str:
+    """Derive the range published by a GitHub Actions push or pull request."""
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    event_path = os.environ.get("GITHUB_EVENT_PATH", "")
+    if not event_name or not event_path:
+        raise GateError("--ci-range needs GITHUB_EVENT_NAME and GITHUB_EVENT_PATH (GitHub Actions)")
+    try:
+        event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GateError(f"could not read the GitHub event payload ({exc})") from exc
+    if _run_git(["git", "rev-parse", "--is-shallow-repository"]).strip() != "false":
+        raise GateError(
+            "--ci-range needs full history; this checkout is shallow "
+            "(set fetch-depth: 0 on actions/checkout)"
+        )
+
+    def resolvable(oid: object) -> bool:
+        if not isinstance(oid, str) or not _OBJECT_ID.fullmatch(oid):
+            return False
+        if _NULL_OBJECT_ID.fullmatch(oid):
+            return False
+        return _git_or_none(["git", "cat-file", "-e", f"{oid}^{{commit}}"]) is not None
+
+    if event_name in ("pull_request", "pull_request_target"):
+        pr = event.get("pull_request") or {}
+        base = (pr.get("base") or {}).get("sha")
+        head = (pr.get("head") or {}).get("sha")
+        if not (resolvable(base) and resolvable(head)):
+            raise GateError("the pull request's base or head commit is not in this checkout")
+        return f"{head} HEAD --not {base}"
+    if event_name == "push":
+        if event.get("deleted"):
+            return ""
+        after = event.get("after")
+        if not resolvable(after):
+            raise GateError("the pushed commit is not in this checkout")
+        before = event.get("before")
+        if resolvable(before):
+            return f"{before}..{after}"
+        ref = str(event.get("ref", ""))
+        if ref.startswith("refs/tags/"):
+            # A tag push: name the tag itself so its object (message, tagger) is
+            # scanned, not only the commits it peels to.
+            tag = _git_or_none(["git", "rev-parse", "--verify", "-q", ref])
+            if tag is not None:
+                after = tag.strip()
+        # Post-push, origin/<branch> already equals *after*, so it is left out of
+        # the subtraction; every other remote ref (the default branch above all)
+        # still bounds the range. A force-push to the default branch with *before*
+        # gone therefore rescans its history -- deliberately: that is a history
+        # rewrite, exactly when everything published should be judged again.
+        exclude = []
+        if ref.startswith("refs/heads/"):
+            exclude = [f"--exclude=origin/{ref[len('refs/heads/') :]}"]
+        return " ".join([after, "--not", *exclude, "--remotes=origin"])
+    raise GateError(
+        f"--ci-range does not know the {event_name!r} event; run it on push and pull_request"
+    )
 
 
 def _scan_index_snapshot(identifiers: frozenset[str], paths: list[Path], **kwargs: Any) -> Any:
@@ -949,6 +1266,13 @@ def _run(args: argparse.Namespace) -> int:
         return _scan_message_file(Path(args.message_file))
     if args.rev_range is not None:
         return _scan_rev_range(args.rev_range)
+    if args.ci_range:
+        ci_range = _ci_rev_range()
+        if not ci_range:
+            print("branch deletion: nothing is published; nothing to scan.", file=sys.stderr)
+            return 0
+        print(f"scanning the published range: {ci_range}", file=sys.stderr)
+        return _scan_rev_range(ci_range)
 
     paths = collect_staged_paths() if args.staged else collect_tracked_paths()
 
@@ -962,7 +1286,8 @@ def _run(args: argparse.Namespace) -> int:
         print(
             "\nThese paths are gitignored by convention (samples/ holds real "
             "identifier-bearing data — hostnames, service accounts, principal "
-            "handles). Remove them from the index: git rm --cached -r <path>.",
+            "handles), or live under .venv/ and are never source. Remove them "
+            "from the index: git rm --cached -r <path>.",
             file=sys.stderr,
         )
         return 1
@@ -978,7 +1303,7 @@ def _run(args: argparse.Namespace) -> int:
     if identifiers is None:
         return 0
 
-    scan_paths = [p for p in paths if not any(part in _SKIP_DIRS for part in p.parts)]
+    scan_paths = paths  # tracked-ness decides; no path-based skip (see _VENV_DIR)
     unreadable: list[Path] = []
     # --staged judges the index blobs (what the commit records), never the worktree.
     scan = _scan_index_snapshot if args.staged else scan_files
@@ -1021,11 +1346,22 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument(
         "--rev-range",
         metavar="RANGE",
-        help="Scan the commit messages in a git rev range (for the pre-push "
-        "hook), e.g. origin/main..HEAD.",
+        help="Scan everything a git rev range publishes (for the pre-push hook): "
+        "every commit's message, author/committer identity, and added or changed "
+        "files, e.g. origin/main..HEAD.",
+    )
+    mode.add_argument(
+        "--ci-range",
+        action="store_true",
+        help="As --rev-range, with the range derived from the GitHub Actions event "
+        "(push or pull_request); needs a full-history checkout.",
     )
     args = parser.parse_args(argv)
     _DECLARATION_FROM_INDEX[0] = bool(args.staged)
+    # Judge the objects git would PUBLISH, not local replacements: refs/replace
+    # can make every read here see a clean surrogate while a push sends the
+    # original (demonstrated end to end). Applies to every git subprocess.
+    os.environ["GIT_NO_REPLACE_OBJECTS"] = "1"
 
     try:
         return _run(args)
