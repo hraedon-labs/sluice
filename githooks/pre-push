@@ -10,18 +10,23 @@
 #      declared visibility, all read from the tracked publication.toml. This is
 #      the accident class the content denylist never covered: right bytes, wrong
 #      destination.
-#   2. Commit messages in the push range — the last chance to catch an identifier
-#      in a message before it is published. The commit-msg hook covers new
-#      commits; this covers rebases, amends, cherry-picks, and anything authored
-#      before the hook was installed.
+#   2. Commit messages in the push range -- the last chance to catch an
+#      identifier in a message before it is published. New branches and
+#      force-pushes scan every commit not on any ref of the remote; deletions
+#      publish nothing. (A whole-range content/identity scan is in review
+#      separately.)
 #
 # git passes "<remote-name> <remote-url>" as argv and the ref updates on stdin as
 # "<local-ref> <local-sha> <remote-ref> <remote-sha>".
 #
 # Activate (once per clone):   scripts/install-git-hooks.sh
 #
+# No denylist: the gate decides from publication.toml. Public is refused;
+# private-until-review stays a no-op. GATE_ALLOW_NO_DENYLIST=1 is the only bypass
+# for the identifier-gate leg and prints a warning every time it is used.
+#
 # HONEST SCOPE: layer 3/4 accident prevention, not a security boundary — a hook
-# is bypassable with --no-verify and absent until installed. CI is the hard gate.
+# is bypassable with --no-verify and absent until installed.
 set -euo pipefail
 
 remote_name="${1:-origin}"
@@ -29,13 +34,17 @@ remote_url="${2:-}"
 repo_root="$(git rev-parse --show-toplevel)"
 
 python_bin="$repo_root/.venv/bin/python"
-[ -x "$python_bin" ] || python_bin="$(command -v python3 || command -v python)"
+[ -x "$python_bin" ] || python_bin="$(command -v python3 || command -v python || true)"
+if [ -z "$python_bin" ]; then
+  echo "sluice pre-push: FATAL: no Python interpreter found; the publication gates cannot run." >&2
+  exit 1
+fi
 
 # Resolve the denylist once (same order as pre-commit; see that hook).
 if [ -z "${FORBIDDEN_IDENTIFIERS:-}" ]; then
   for candidate in \
     "$repo_root/.identifiers-denylist.local" \
-    "$HOME/.config/agent-suite/forbidden-identifiers"; do
+    "${HOME:-}/.config/agent-suite/forbidden-identifiers"; do
     if [ -f "$candidate" ]; then
       FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
       export FORBIDDEN_IDENTIFIERS
@@ -43,8 +52,30 @@ if [ -z "${FORBIDDEN_IDENTIFIERS:-}" ]; then
     fi
   done
 fi
-if [ -z "${FORBIDDEN_IDENTIFIERS:-}" ]; then
-  echo "sluice pre-push: message gate INACTIVE — no denylist found." >&2
+no_denylist=0
+denylist="${FORBIDDEN_IDENTIFIERS:-}"
+if [ -z "${denylist//[[:space:]]/}" ]; then
+  no_denylist=1
+  if [ "${GATE_ALLOW_NO_DENYLIST:-}" = "1" ]; then
+    echo "sluice pre-push: WARNING: identifier gate BYPASSED (GATE_ALLOW_NO_DENYLIST=1) -- no denylist, the outgoing ranges were NOT scanned." >&2
+  fi
+fi
+
+# Decide the unusable-denylist case once, before reading the ref updates: a
+# deletion-only push runs no range scan below, and a public repo whose denylist
+# is missing OR unusable (e.g. only too-short entries) must still be refused.
+# (--message-file on an empty file: the gate resolves the denylist first, so it
+# exits 1 on a public declaration without a usable one, 0 otherwise.)
+if [ "${GATE_ALLOW_NO_DENYLIST:-}" = "1" ]; then
+  # Warn on EVERY use of the opt-out, not only when no denylist text was found:
+  # a denylist of unusable entries is no denylist, and the precheck is skipped.
+  [ "$no_denylist" -eq 1 ] || echo "sluice pre-push: WARNING: GATE_ALLOW_NO_DENYLIST=1 is set -- the identifier gate is BYPASSED for this push if the denylist is unusable." >&2
+else
+  if ! "$python_bin" "$repo_root/scripts/check_committed_identifiers.py" \
+      --message-file /dev/null; then
+    echo "sluice pre-push: fix: put the denylist in ~/.config/agent-suite/forbidden-identifiers (or export FORBIDDEN_IDENTIFIERS); to bypass once, GATE_ALLOW_NO_DENYLIST=1 (warned)." >&2
+    exit 1
+  fi
 fi
 
 zero_sha="0000000000000000000000000000000000000000"
@@ -68,8 +99,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # published rather than a diff against a commit that no longer exists.
   if [ "$remote_sha" = "$zero_sha" ] \
      || ! git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
-    # Passed as one string; the Python side splits it into git log arguments.
-    rev_range="$local_sha --not --remotes=$remote_name"
+    # A direct URL is not a configured remote and has no remote-tracking refs;
+    # in that case the only honest range is the whole local history.
+    if git remote get-url "$remote_name" >/dev/null 2>&1; then
+      rev_range="$local_sha --not --remotes=$remote_name"
+    else
+      rev_range="$local_sha"
+    fi
   else
     rev_range="$remote_sha..$local_sha"
   fi
@@ -79,10 +115,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     status=1
   fi
 
-  if [ -n "${FORBIDDEN_IDENTIFIERS:-}" ]; then
-    if ! "$python_bin" "$repo_root/scripts/check_committed_identifiers.py" \
-        --rev-range "$rev_range"; then
-      status=1
+  if [ "$no_denylist" -eq 1 ] && [ "${GATE_ALLOW_NO_DENYLIST:-}" = "1" ]; then
+    continue
+  fi
+  if ! "$python_bin" "$repo_root/scripts/check_committed_identifiers.py" \
+      --rev-range "$rev_range"; then
+    status=1
+    if [ "$no_denylist" -eq 1 ]; then
+      echo "sluice pre-push: fix: put the denylist in ~/.config/agent-suite/forbidden-identifiers (or export FORBIDDEN_IDENTIFIERS); to bypass once, GATE_ALLOW_NO_DENYLIST=1 (warned)." >&2
     fi
   fi
 done

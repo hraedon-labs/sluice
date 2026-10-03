@@ -192,6 +192,28 @@ class VisibilityContract(unittest.TestCase):
             check=False,
         )
 
+    def _shallow_clone(self, depth: int = 1) -> Path:
+        """Clone self.root with --depth *depth* and point self.root at the clone."""
+        source = self.root
+        clone = Path(self._tmp.name) / f"shallow{self._count}"
+        subprocess.run(
+            [_GIT, "clone", "-q", f"--depth={depth}", source.resolve().as_uri(), str(clone)],
+            check=True,
+            env=self._env(),
+            capture_output=True,
+        )
+        self.root = clone
+        is_shallow = subprocess.run(
+            [_GIT, "rev-parse", "--is-shallow-repository"],
+            cwd=clone,
+            check=True,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(is_shallow, "true")  # the fixture really is shallow
+        return clone
+
     @staticmethod
     def _declare(visibility: str) -> str:
         """A minimal declaration body naming *visibility*."""
@@ -690,28 +712,6 @@ class DeclarationSourceContract(VisibilityContract):
 
     # -- a shallow clone cannot judge absence ---------------------------------
 
-    def _shallow_clone(self, depth: int = 1) -> Path:
-        """Clone self.root with --depth *depth* and point self.root at the clone."""
-        source = self.root
-        clone = Path(self._tmp.name) / f"shallow{self._count}"
-        subprocess.run(
-            [_GIT, "clone", "-q", f"--depth={depth}", source.resolve().as_uri(), str(clone)],
-            check=True,
-            env=self._env(),
-            capture_output=True,
-        )
-        self.root = clone
-        is_shallow = subprocess.run(
-            [_GIT, "rev-parse", "--is-shallow-repository"],
-            cwd=clone,
-            check=True,
-            env=self._env(),
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        self.assertEqual(is_shallow, "true")  # the fixture really is shallow
-        return clone
-
     def test_shallow_clone_cannot_launder_a_deleted_public_declaration(self) -> None:
         """actions/checkout is depth 1 by default: the deleting commit is all it sees.
 
@@ -1015,9 +1015,204 @@ class DeclarationSourceContract(VisibilityContract):
             self.assertEqual(result.returncode, 1, result.stderr)
 
 
-# The subclass exists for its own tests; do not run the inherited ones twice.
-for _name in [n for n in vars(VisibilityContract) if n.startswith("test_")]:
-    setattr(DeclarationSourceContract, _name, None)
+class TrackednessContract(VisibilityContract):
+    """What is scanned is decided by git tracked-ness, never by path.
+
+    Subclasses VisibilityContract only to share its fixtures; the inherited tests
+    are blanked out after the class body so they do not run twice.
+    """
+
+    def test_a_tracked_file_under_venv_is_refused_without_a_denylist(self) -> None:
+        """A force-added .venv/ file (root or nested) is refused in every mode."""
+        for where in (".venv/leak.txt", "pkg/.venv/lib/leak.txt"):
+            with self.subTest(path=where):
+                self._fresh()
+                self._run(self._declare("private-until-review"))
+                target = self.root / where
+                target.parent.mkdir(parents=True)
+                target.write_text("clean content\n", encoding="utf-8")
+                self._git("add", "-f", where)
+                self.assertEqual(self._gate("--staged").returncode, 1)
+                self._git("commit", "-q", "--no-verify", "-m", "force-add venv")
+                self.assertEqual(self._gate().returncode, 1)
+
+    def test_an_untracked_venv_is_not_read(self) -> None:
+        """Control: an ordinary, untracked .venv/ holding the token blocks nothing."""
+        self._run(self._declare("private-until-review"))
+        venv = self.root / ".venv"
+        venv.mkdir()
+        (venv / "leak.txt").write_text("zzzsynthetictoken\n", encoding="utf-8")
+        result = self._gate(denylist="zzzsynthetictoken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_file_merely_named_venv_is_scanned_not_refused(self) -> None:
+        """Only a .venv DIRECTORY is refused; a file named .venv is scanned as usual."""
+        self._run(self._declare("private-until-review"))
+        (self.root / ".venv").write_text("clean\n", encoding="utf-8")
+        self._git("add", "-f", ".venv")
+        self._git("commit", "-q", "--no-verify", "-m", "file named .venv")
+        self.assertEqual(self._gate(denylist="zzzsynthetictoken").returncode, 0)
+        (self.root / ".venv").write_text("zzzsynthetictoken\n", encoding="utf-8")
+        self._git("add", "-f", ".venv")
+        self._git("commit", "-q", "--no-verify", "-m", "token")
+        self.assertEqual(self._gate(denylist="zzzsynthetictoken").returncode, 1)
+
+
+class LocalHookContract(VisibilityContract):
+    """The commit-msg hook fails closed on a public repo with no denylist.
+
+    Runs the repo's own githooks/commit-msg against a fixture repo carrying a copy
+    of the gate. Subclasses VisibilityContract only to share its fixtures; the
+    inherited tests are blanked out after the class body so they do not run twice.
+    """
+
+    HOOK = GATE.parent.parent / "githooks" / "commit-msg"
+
+    def _hook(self, visibility: str, **extra: str) -> subprocess.CompletedProcess[str]:
+        """Run the commit-msg hook in a fixture declaring *visibility*, no denylist."""
+        self._run(self._declare(visibility))
+        scripts = self.root / "scripts"
+        scripts.mkdir(exist_ok=True)
+        for source in GATE.parent.glob("check_*.py"):
+            shutil.copy2(source, scripts / source.name)
+        message = self.root / "msg.txt"
+        message.write_text("an ordinary message\n", encoding="utf-8")
+        env = self._env()
+        env.update(extra)
+        bash = shutil.which("bash") or "bash"
+        return subprocess.run(
+            [bash, str(self.HOOK), str(message)],
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    def setUp(self) -> None:
+        """Skip where the repo carries no commit-msg hook or no bash."""
+        if os.name == "nt" or not self.HOOK.is_file() or shutil.which("bash") is None:
+            self.skipTest("POSIX hook test: no githooks/commit-msg, no bash, or Windows")
+        super().setUp()
+
+    def test_public_repo_without_a_denylist_is_refused_with_a_hint(self) -> None:
+        """Exit 1, and the output names the one opt-out."""
+        result = self._hook("public")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("GATE_ALLOW_NO_DENYLIST", result.stderr)
+
+    def test_explicit_opt_out_passes_loudly(self) -> None:
+        """GATE_ALLOW_NO_DENYLIST=1 is the only bypass, and it says so every time."""
+        result = self._hook("public", GATE_ALLOW_NO_DENYLIST="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BYPASS", result.stderr.upper())
+
+    def test_any_other_opt_out_value_does_not_bypass(self) -> None:
+        """Only the exact value 1 opts out: "true", "yes", "0" do not."""
+        for value in ("true", "yes", "0", " 1"):
+            with self.subTest(value=value):
+                self._fresh()
+                result = self._hook("public", GATE_ALLOW_NO_DENYLIST=value)
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    PRE_PUSH = GATE.parent.parent / "githooks" / "pre-push"
+
+    def test_a_deletion_only_push_still_refuses_a_public_repo_without_a_denylist(self) -> None:
+        """No range is scanned for a deletion, but the missing-denylist rule still holds."""
+        for visibility, expected in (("public", 1), ("private-until-review", 0)):
+            with self.subTest(visibility=visibility):
+                self._fresh()
+                self._hook(visibility)  # fixture: declaration, scripts/ copied
+                head = subprocess.run(
+                    [_GIT, "rev-parse", "HEAD"],
+                    cwd=self.root,
+                    env=self._env(),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+                bash = shutil.which("bash") or "bash"
+                result = subprocess.run(
+                    [bash, str(self.PRE_PUSH), "origin", "https://example.invalid/x.git"],
+                    cwd=self.root,
+                    env=self._env(),
+                    input=f"refs/heads/gone {'0' * 40} refs/heads/gone {head}\n",
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_a_deletion_only_push_refuses_an_unusable_denylist_too(self) -> None:
+        """A denylist of only too-short entries is no denylist on a public repo."""
+        self._hook("public")
+        head = subprocess.run(
+            [_GIT, "rev-parse", "HEAD"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        env = self._env()
+        env[DENYLIST_VAR] = "ab cd"
+        bash = shutil.which("bash") or "bash"
+        result = subprocess.run(
+            [bash, str(self.PRE_PUSH), "origin", "https://example.invalid/x.git"],
+            cwd=self.root,
+            env=env,
+            input=f"refs/heads/gone {'0' * 40} refs/heads/gone {head}\n",
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_the_opt_out_warns_even_when_the_denylist_is_merely_unusable(self) -> None:
+        """GATE_ALLOW_NO_DENYLIST=1 with only too-short entries: passes, and says so."""
+        self._hook("public")
+        head = subprocess.run(
+            [_GIT, "rev-parse", "HEAD"],
+            cwd=self.root,
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        env = self._env()
+        env[DENYLIST_VAR] = "ab"
+        env["GATE_ALLOW_NO_DENYLIST"] = "1"
+        bash = shutil.which("bash") or "bash"
+        result = subprocess.run(
+            [bash, str(self.PRE_PUSH), "origin", "https://example.invalid/x.git"],
+            cwd=self.root,
+            env=env,
+            input=f"refs/heads/gone {'0' * 40} refs/heads/gone {head}\n",
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BYPASS", result.stderr.upper())
+
+    def test_private_repo_without_a_denylist_is_unchanged(self) -> None:
+        """private-until-review keeps its no-op: a fresh clone is not bricked."""
+        result = self._hook("private-until-review")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+# The subclasses exist for their own tests; do not run the inherited ones again.
+for _cls in (
+    DeclarationSourceContract,
+    TrackednessContract,
+    LocalHookContract,
+):
+    for _name in [n for n in vars(VisibilityContract) if n.startswith("test_")]:
+        setattr(_cls, _name, None)
 
 
 if __name__ == "__main__":
